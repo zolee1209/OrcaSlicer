@@ -10945,9 +10945,33 @@ void DynamicPrintConfig::update_values_to_printer_extruders_for_multiple_filamen
         //apply process settings
         auto opt_extruder_type = dynamic_cast<const ConfigOptionEnumsGeneric*>(printer_config.option("extruder_type"));
         auto opt_nozzle_volume_type = dynamic_cast<const ConfigOptionEnumsGeneric*>(printer_config.option("nozzle_volume_type"));
-        if (!opt_extruder_type || !opt_nozzle_volume_type) {
-            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format(", Line %1%: extruder_type or nozzle_volume_type option not found, skipping")%__LINE__;
-            return;
+        // Fallback: if extruder_type or nozzle_volume_type are missing from the printer config
+        // (e.g. third-party profiles that do not define these BBL-specific keys), synthesize them
+        // from defaults so the loop below can safely dereference them. This mirrors what
+        // Preset::normalize() / PresetBundle::load_project_based_presets() do in GUI mode.
+        std::unique_ptr<ConfigOptionEnumsGeneric> synth_extruder_type;
+        std::unique_ptr<ConfigOptionEnumsGeneric> synth_nozzle_volume_type;
+        if (!opt_extruder_type) {
+            // default: all extruders are Direct Drive
+            synth_extruder_type = std::make_unique<ConfigOptionEnumsGeneric>();
+            synth_extruder_type->values.assign(extruder_count, static_cast<int>(etDirectDrive));
+            synth_extruder_type->keys_map = &ConfigOptionEnum<ExtruderType>::get_enum_values();
+            opt_extruder_type = synth_extruder_type.get();
+            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format(", Line %1%: extruder_type missing, defaulting to DirectDrive for all %2% extruder(s)")%__LINE__ %extruder_count;
+        }
+        if (!opt_nozzle_volume_type) {
+            // default: all extruders use Standard nozzle volume – copy from default_nozzle_volume_type
+            // if available, otherwise synthesise nvtStandard for each extruder
+            auto *def_nvt = dynamic_cast<const ConfigOptionEnumsGeneric*>(printer_config.option("default_nozzle_volume_type"));
+            if (def_nvt) {
+                synth_nozzle_volume_type = std::make_unique<ConfigOptionEnumsGeneric>(*def_nvt);
+            } else {
+                synth_nozzle_volume_type = std::make_unique<ConfigOptionEnumsGeneric>();
+                synth_nozzle_volume_type->values.assign(extruder_count, static_cast<int>(nvtStandard));
+                synth_nozzle_volume_type->keys_map = &ConfigOptionEnum<NozzleVolumeType>::get_enum_values();
+            }
+            opt_nozzle_volume_type = synth_nozzle_volume_type.get();
+            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format(", Line %1%: nozzle_volume_type missing, defaulting to Standard for all %2% extruder(s)")%__LINE__ %extruder_count;
         }
 
         auto opt_filament_volume_maps = dynamic_cast<const ConfigOptionInts*>(printer_config.option("filament_volume_map"));
@@ -11007,7 +11031,6 @@ void DynamicPrintConfig::update_values_to_printer_extruders_for_multiple_filamen
                 BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format(", Line %1%: can not find opt define for %2%")%__LINE__%key;
                 continue;
             }
-
             switch (optdef->type) {
                 case coStrings:
                 {
@@ -12323,6 +12346,15 @@ CLIMiscConfigDef::CLIMiscConfigDef()
     def->tooltip = L("Load filament IDs for each object.");
     def->cli_params = "\"1,2,3,1\"";
     def->set_default_value(new ConfigOptionInts());
+
+    def = this->add("filament_colour", coStrings);
+    def->label = L("Filament colours");
+    def->tooltip = L("Set the colour for each loaded filament slot (one per --load-filaments entry). "
+                     "Used to calculate flush volumes between filament transitions. "
+                     "Colours are specified as HTML hex values separated by semicolons. "
+                     "Defaults to: \"#DBDBDB\" for every filament slot.");
+    def->cli_params = "\"#RRGGBB;#RRGGBB;...\"";
+    def->set_default_value(new ConfigOptionStrings{ "#DBDBDB" });
 
     def = this->add("allow_multicolor_oneplate", coBool);
     def->label = L("Allow multiple colors on one plate");
