@@ -1845,7 +1845,7 @@ int CLI::run(int argc, char **argv)
                     int object_extruder_id = 0, clone_count = 1;
                     if (loaded_filament_ids.size() > input_index) {
                         if (loaded_filament_ids[input_index] > 0) {
-                            if (loaded_filament_ids[input_index] > load_filaments.size()) {
+                            if (loaded_filament_ids[input_index] > (int)load_filaments.size()) {
                                 BOOST_LOG_TRIVIAL(error) << boost::format("invalid filament_id %1% at index %2%, max %3%")%loaded_filament_ids[input_index] % (input_index + 1) %load_filaments.size();
                                 record_exit_reson(outfile_dir, CLI_INVALID_PARAMS, 0, cli_errors[CLI_INVALID_PARAMS], sliced_info);
                                 flush_and_exit(CLI_INVALID_PARAMS);
@@ -3246,6 +3246,33 @@ int CLI::run(int argc, char **argv)
     if (m_print_config.option<ConfigOptionFloats>("nozzle_diameter")) {
         new_extruder_count = m_print_config.option<ConfigOptionFloats>("nozzle_diameter")->values.size();
         new_is_multi_extruder = new_extruder_count > 1;
+        // Normalize extruder variant options (extruder_variant_list, printer_extruder_variant,
+        // printer_extruder_id, extruder_type) the same way Preset::normalize() does for GUI mode.
+        // This is required for third-party printer profiles that do not define these keys explicitly,
+        // so that update_values_to_printer_extruders* in Print::Apply can safely access them.
+        // set_num_extruders() requires printer_extruder_id and printer_extruder_variant to already
+        // exist in the config (asserted inside extend_extruder_variant). Initialize them from defaults
+        // if they are missing, so the call is safe for profiles that omit these keys.
+        {
+            const auto &defaults = FullPrintConfig::defaults();
+            for (const char *key : {"printer_extruder_id", "printer_extruder_variant"}) {
+                if (!m_print_config.has(key)) {
+                    const ConfigOption *def_opt = defaults.option(key);
+                    if (def_opt)
+                        m_print_config.set_key_value(key, def_opt->clone());
+                }
+            }
+        }
+        m_print_config.set_num_extruders(new_extruder_count);
+        // nozzle_volume_type is a project-level option (not in extruder_option_keys, so not handled
+        // by set_num_extruders). In GUI mode it is populated from default_nozzle_volume_type by
+        // PresetBundle::load_project_based_presets. Mirror that logic here for CLI mode.
+        if (!m_print_config.has("nozzle_volume_type")) {
+            auto *def_nvt = dynamic_cast<const ConfigOptionEnumsGeneric*>(
+                m_print_config.option("default_nozzle_volume_type"));
+            if (def_nvt)
+                m_print_config.set_key_value("nozzle_volume_type", def_nvt->clone());
+        }
         new_printer_extruder_variants = m_print_config.option<ConfigOptionStrings>("printer_extruder_variant", true)->values;
         new_printer_variant_count = new_printer_extruder_variants.size();
     }
@@ -3748,6 +3775,22 @@ int CLI::run(int argc, char **argv)
         std::vector<std::string>& project_filament_colors = project_filament_colors_option->values;
         project_filament_colors.resize(filament_count, "#FFFFFF");
     }
+    // If filament_colour is still missing (no --filament-colour arg, no colours in the loaded JSON),
+    // synthesise a distinct placeholder colour per filament so that flush_volumes_matrix and
+    // filament_nums in ToolOrdering::get_recommended_filament_maps are populated correctly.
+    // Without this, the auto filament→extruder mapping sees 0 filaments and assigns everything to
+    // extruder 1, producing single-colour output even for multi-filament IDEX prints.
+    if ((!project_filament_colors_option || project_filament_colors_option->values.size() == 0) && filament_count > 0) {
+        // Use visually distinct default colours so the flush volume calculator gives reasonable results.
+        static const char* default_colors[] = {"#FFFFFF", "#000000", "#FF0000", "#00FF00", "#0000FF", "#FFFF00", "#FF00FF", "#00FFFF"};
+        constexpr int num_defaults = sizeof(default_colors) / sizeof(default_colors[0]);
+        project_filament_colors_option = m_print_config.option<ConfigOptionStrings>("filament_colour", true);
+        std::vector<std::string>& project_filament_colors = project_filament_colors_option->values;
+        project_filament_colors.resize(filament_count);
+        for (int i = 0; i < filament_count; i++)
+            project_filament_colors[i] = default_colors[i % num_defaults];
+        BOOST_LOG_TRIVIAL(info) << boost::format("no filament colours in project or cli args, synthesised %1% default colour(s) for filament mapping") % filament_count;
+    }
 
     if (project_filament_colors_option &&
         (selected_filament_colors_option || !m_print_config.option<ConfigOptionFloats>("flush_volumes_matrix") || (current_extruder_count != new_extruder_count) || (new_nozzle_volume_type != current_nozzle_volume_type)))
@@ -3810,6 +3853,30 @@ int CLI::run(int argc, char **argv)
 
             //computing
             ConfigOptionBools* filament_is_support = m_print_config.option<ConfigOptionBools>("filament_is_support", true);
+
+            // Ensure all per-filament boolean/string vectors are sized to project_filament_count.
+            // When profiles are loaded without the full GUI PresetBundle (CLI mode), some vectors
+            // may be sized to 1 (the default) rather than the actual filament count.
+            if (filament_is_support->size() < project_filament_count) {
+                BOOST_LOG_TRIVIAL(info) << boost::format("resizing filament_is_support from %1% to %2%")
+                    % filament_is_support->size() % project_filament_count;
+                filament_is_support->values.resize(project_filament_count, false);
+            }
+            // Resize other per-filament vectors that flush-volume computation reads.
+            // This prevents size-mismatch errors when profiles use inherits chains that don't
+            // explicitly set these keys for every filament slot.
+            for (const char* key : {"filament_retraction_distances_when_cut", "retraction_distances_when_cut"}) {
+                auto* opt = m_print_config.option<ConfigOptionFloats>(key);
+                if (opt && opt->values.size() < project_filament_count)
+                    opt->values.resize(project_filament_count, opt->values.empty() ? 18.0 : opt->values[0]);
+            }
+            for (const char* key : {"filament_long_retractions_when_cut", "long_retractions_when_cut"}) {
+                auto* opt = m_print_config.option<ConfigOptionBoolsNullable>(key);
+                if (opt && opt->values.size() < project_filament_count) {
+                    unsigned char fill = opt->values.empty() ? (unsigned char)0 : opt->values[0];
+                    opt->values.resize(project_filament_count, fill);
+                }
+            }
 
             const std::vector<int> &min_flush_volumes = Slic3r::GUI::get_min_flush_volumes(m_print_config, 0);
 
