@@ -47,6 +47,21 @@ echo -n "[9/9] Generating Linux app..."
     fi
     cp -fl "${ORIGINAL_BINARY_LOCATION}" package/bin/@SLIC3R_APP_CMD@
 
+    # Bundle any shared libraries from the deps install prefix that the binary
+    # depends on (e.g. libtbb.so.12 when built with dynamic TBB).
+    # The orca-slicer wrapper script already sets LD_LIBRARY_PATH=$DIR/bin.
+    DEPS_LIB="@CMAKE_BINARY_DIR@/../deps/build/OrcaSlicer_dep/usr/local/lib"
+    if [ -d "${DEPS_LIB}" ]; then
+        while IFS= read -r so_path; do
+            real_so=$(readlink -f "${so_path}" 2>/dev/null)
+            if [ -f "${real_so}" ]; then
+                cp -f "${real_so}" package/bin/
+                # Also copy the versioned symlink if different from real path
+                [ "${so_path}" != "${real_so}" ] && cp -f "${so_path}" package/bin/ 2>/dev/null || true
+            fi
+        done < <(ldd "package/bin/@SLIC3R_APP_CMD@" 2>/dev/null | awk '/=> \//{print $3}' | grep "${DEPS_LIB}" || true)
+    fi
+
     # create bin
 cat << EOF >@SLIC3R_APP_CMD@
 #!/bin/bash

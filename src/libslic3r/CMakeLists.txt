@@ -98,6 +98,8 @@ set(lisbslic3r_sources
     Color.cpp
     Color.hpp
     CommonDefs.hpp
+    CliPresetResolver.cpp
+    CliPresetResolver.hpp
     Config.cpp
     Config.hpp
     CustomGCode.cpp
