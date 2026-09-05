@@ -3,7 +3,7 @@
     "name": "0.30mm Normal @RatRig V-Core 4 IDEX 500 COPY MODE 0.6",
     "inherits": "fdm_process_ratrig_common",
     "from": "system",
-    "setting_id": "GP006",
+    "setting_id": "4gEDy48ZewU8wfpW",
     "instantiation": "true",
     "bottom_shell_layers": "3",
     "bridge_flow": "0.85",

@@ -3,7 +3,7 @@
     "name": "1.00mm Strong @RatRig V-Core 4 IDEX 500 MIRROR MODE 1.8",
     "inherits": "fdm_process_ratrig_common",
     "from": "system",
-    "setting_id": "GP006",
+    "setting_id": "aPsicbuw1tK3H6So",
     "instantiation": "true",
     "bottom_shell_layers": "3",
     "bridge_flow": "0.85",

@@ -3,7 +3,7 @@
     "name": "1.00mm Normal @RatRig V-Core 4 HYBRID 500 1.8",
     "inherits": "fdm_process_ratrig_common",
     "from": "system",
-    "setting_id": "GP006",
+    "setting_id": "E5q7KpCTnjYbRJVE",
     "instantiation": "true",
     "bottom_shell_layers": "3",
     "bridge_flow": "0.85",
