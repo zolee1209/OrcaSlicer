@@ -1550,7 +1550,7 @@ int CLI::run(int argc, char **argv)
     std::string new_printer_name, current_printer_name, new_process_name, current_process_name, current_printer_system_name, current_process_system_name, new_process_system_name, new_printer_system_name, printer_model_id, current_printer_model, printer_model, new_default_process_name;
     std::vector<std::string> upward_compatible_printers, new_print_compatible_printers, current_print_compatible_printers, current_different_settings;
     std::vector<std::string> current_filaments_name, current_filaments_system_name, current_inherits_group, current_extruder_variants, new_extruder_variants, current_print_extruder_variants, new_printer_extruder_variants;
-    DynamicPrintConfig load_process_config, load_machine_config;
+    DynamicPrintConfig load_process_config, load_machine_config, load_project_config;
     bool new_process_config_is_system = true, new_printer_config_is_system = true;
     std::string pipe_name, makerlab_name, makerlab_version, different_process_setting;
     const std::vector<std::string>              &metadata_name               = m_config.option<ConfigOptionStrings>("metadata_name", true)->values;
@@ -2083,6 +2083,17 @@ int CLI::run(int argc, char **argv)
             if (from_iter != key_values.end())
                 config_from = from_iter->second;
 
+            // A project settings JSON (from=project, exported via File > Export > Export All
+            // Configs) contains the fully-merged config for all profiles combined. Load it
+            // directly and let the caller apply it to m_print_config, skipping the normal
+            // machine/process/filament split + inherits-resolution logic below.
+            if (config_from == "project") {
+                config_type = "project";
+                BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": loaded project settings file " << file;
+                config = std::move(raw_config);
+                return 0;
+            }
+
             if ((config_from != "system")&&(config_from != "User")&&(config_from != "user")) {
                 boost::nowide::cerr <<__FUNCTION__ << boost::format(":file %1%'s from %2% unsupported") % file % config_from;
                 return CLI_CONFIG_FILE_ERROR;
@@ -2273,6 +2284,26 @@ int CLI::run(int argc, char **argv)
             load_process_config = std::move(config);
             BOOST_LOG_TRIVIAL(info) << boost::format("loaded process config %1%, type %2%, name %3%, inherits %4%")%file %config_name %config_from % new_process_system_name;
         }
+        else if (config_type == "project") {
+            // Project settings JSON contains the fully-merged config (all profiles combined).
+            // Apply it directly to m_print_config so all keys are available to the slicer,
+            // then extract the relevant IDs for compatibility checks.
+            load_project_config = std::move(config);
+            new_printer_name = load_project_config.option<ConfigOptionString>("printer_settings_id", true)->value;
+            new_printer_system_name = new_printer_name;
+            new_printer_config_is_system = true;
+            printer_model = load_project_config.option<ConfigOptionString>("printer_model", true)->value;
+            new_process_name = load_project_config.option<ConfigOptionString>("print_settings_id", true)->value;
+            new_process_system_name = new_process_name;
+            new_process_config_is_system = true;
+            if (load_project_config.option<ConfigOptionStrings>("print_compatible_printers"))
+                new_print_compatible_printers = load_project_config.option<ConfigOptionStrings>("print_compatible_printers")->values;
+            BOOST_LOG_TRIVIAL(info) << boost::format("loaded project config, printer=%1%, process=%2%, compatible_printers=%3%")
+                % new_printer_name % new_process_name % new_print_compatible_printers.size();
+            // Skip printer technology check – project configs always have ptFFF.
+            printer_technology = ptFFF;
+            continue;
+        }
 
         PrinterTechnology other_printer_technology = get_printer_technology(config);
         if (printer_technology == ptUnknown) {
@@ -2284,6 +2315,13 @@ int CLI::run(int argc, char **argv)
             record_exit_reson(outfile_dir, CLI_INVALID_PRINTER_TECH, 0, cli_errors[CLI_INVALID_PRINTER_TECH], sliced_info);
             flush_and_exit(CLI_INVALID_PRINTER_TECH);
         }
+    }
+
+    // If a project config was loaded, apply it as the base for m_print_config before
+    // the standard machine/process/filament processing continues.
+    if (!load_project_config.keys().empty()) {
+        m_print_config.apply(load_project_config, true);
+        BOOST_LOG_TRIVIAL(info) << "applied project config to m_print_config, keys=" << load_project_config.keys().size();
     }
 
     //load filaments files
