@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <string>
 #include <cstring>
+#include <ctime>
 #include <iostream>
 #include <math.h>
 #include <csignal>
@@ -387,6 +388,37 @@ void default_status_callback(const PrintBase::SlicingStatus& slicing_status)
     }
     BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << boost::format(": percent=%1%, warning_step=%2%, message=%3%, message_type=%4%")%slicing_status.percent %slicing_status.warning_step %slicing_status.text %(int)(slicing_status.message_type);
 
+    // Emit a compact, machine-parseable progress line to stdout so parent
+    // processes (e.g. a Flask app spawning us via subprocess.Popen) can watch
+    // progress without needing --debug 4.
+    //
+    // IMPORTANT: g-code export calls this callback once per layer (potentially
+    // 100s–1000s of times per plate) always with percent=80.  If we printed
+    // every call, the ~64 KB kernel pipe buffer would fill up and every
+    // subsequent write() would block — which is exactly the pipe backpressure
+    // deadlock we are trying to avoid.  Instead we only emit a line when the
+    // percent value actually changes.  That gives ~15–20 lines per slice —
+    // negligible volume that will never fill a pipe.
+    static std::mutex           s_progress_mutex;
+    static int                  s_last_percent = -1;
+    static std::string          s_last_text;
+    {
+        std::lock_guard<std::mutex> lock(s_progress_mutex);
+        if (slicing_status.percent != s_last_percent ||
+            slicing_status.text    != s_last_text) {
+            s_last_percent = slicing_status.percent;
+            s_last_text    = slicing_status.text;
+            // Do not print for the per-layer g-code updates (they all report
+            // percent=80 with a "layer N" text): only print the first time we
+            // enter the g-code phase.  The condition above already filters
+            // duplicates so the "layer N" strings would otherwise still all
+            // pass through — suppress them explicitly.
+            if (slicing_status.text.rfind("Generating G-code: layer", 0) != 0) {
+                boost::nowide::cout << "PROGRESS " << slicing_status.percent << "% "
+                                    << slicing_status.text << std::endl;
+            }
+        }
+    }
     return;
 }
 
@@ -1433,12 +1465,68 @@ int CLI::run(int argc, char **argv)
     }
 
     // Setup logging for CLI
+    //
+    // When running multiple CLI instances in parallel (typical use case: a
+    // Flask webapp that spawns orca-slicer via subprocess.Popen), the parent
+    // often captures stdout/stderr through a PIPE.  If the parent does not
+    // actively drain the pipe, the 64 KB kernel pipe buffer fills up and every
+    // subsequent write() from the child blocks in the kernel.  Because
+    // Boost.Log's synchronous console sink is guarded by a global mutex, once
+    // one thread blocks in write(), every other worker thread that tries to
+    // log a record also blocks on that mutex — the whole slicing pipeline
+    // deadlocks and *appears* to hang around the point where verbose logging
+    // becomes most frequent (support generation / g-code export, ~60 %).
+    //
+    // Fix: when the user asks for info+ verbosity, redirect Boost.Log to a
+    // per-PID file inside data_dir()/log/.  Registering a user sink also
+    // implicitly disables Boost.Log's built-in default console sink, so
+    // stdout/stderr are no longer flooded and the pipe never fills.  The
+    // essential progress information is still emitted on stdout by
+    // default_status_callback() as compact "PROGRESS x% ..." lines.
     const ConfigOptionInt* opt_loglevel = m_config.opt<ConfigOptionInt>("debug");
-    if (opt_loglevel) {
-        set_logging_level(opt_loglevel->value);
-    }
-    else {
-        set_logging_level(2);
+    unsigned int cli_log_level = opt_loglevel ? (unsigned int)opt_loglevel->value : 2u;
+    if (cli_log_level > 2) {
+        // Compose a filename that includes the timestamp and PID so that
+        // concurrent instances never write to the same log file.
+        char ts_buf[64] = {0};
+        std::time_t t = std::time(nullptr);
+        std::tm     tm_local{};
+#ifdef _WIN32
+        localtime_s(&tm_local, &t);
+#else
+        localtime_r(&t, &tm_local);
+#endif
+        std::strftime(ts_buf, sizeof(ts_buf), "cli_%Y%m%d_%H%M%S_", &tm_local);
+        std::string log_filename = std::string(ts_buf) + std::to_string(get_current_pid()) + ".log";
+        // Pick a writable log root: prefer data_dir() (set by --datadir or by
+        // the GUI defaults), otherwise fall back to $HOME/.orca-slicer-cli
+        // or the system temp directory so the file sink cannot fail because
+        // of a missing/read-only working directory.
+        std::string log_root = data_dir();
+        if (log_root.empty()) {
+            const char* home = std::getenv("HOME");
+            if (home && *home)
+                log_root = std::string(home) + "/.orca-slicer-cli";
+            else
+                log_root = boost::filesystem::temp_directory_path().string() + "/orca-slicer-cli";
+            // set_data_dir() below is only used so that set_log_path_and_level()
+            // (which internally does `boost::filesystem::path(g_data_dir) / "log"`)
+            // resolves to a writable directory.  Downstream code that also
+            // needs data_dir() (preset lookup etc.) is not affected by this
+            // fallback: those code paths receive an explicit --datadir or use
+            // the standard app config directory later.
+            Slic3r::set_data_dir(log_root);
+        }
+        // set_log_path_and_level installs a rotating file sink and calls
+        // set_logging_level().  Once a user sink is registered, Boost.Log's
+        // default console sink is disabled — so stderr is no longer touched
+        // by BOOST_LOG_TRIVIAL macros.
+        Slic3r::set_log_path_and_level(log_filename, cli_log_level);
+        // Print the log location once to stdout so users know where to look.
+        boost::nowide::cout << "orca-slicer: verbose log at " << log_root
+                            << "/log/" << log_filename << ".*" << std::endl;
+    } else {
+        set_logging_level(cli_log_level);
     }
     const ConfigOptionString* opt_logfile = m_config.opt<ConfigOptionString>("logfile");
     if (opt_logfile) {
@@ -3604,9 +3692,21 @@ int CLI::run(int argc, char **argv)
             std::vector<double> &flush_vol_matrix = m_print_config.option<ConfigOptionFloats>("flush_volumes_matrix", true)->values;
             flush_vol_matrix.resize(project_filament_count * project_filament_count * new_extruder_count, 0.f);
 
-            // set multiplier to 1?
-            std::vector<double>& flush_multipliers = m_print_config.option<ConfigOptionFloats>("flush_multiplier", true)->values;
-            flush_multipliers.resize(new_extruder_count, 1.f);
+            // Apply flushing multiplier: use the --flushing-multiplier CLI value if supplied
+            // (including 0.0 which disables flushing), otherwise default to 1.0.
+            // We detect "not supplied" by checking whether the value equals the option default (1.0)
+            // from CLIMiscConfigDef – but since the user can also explicitly pass 1.0 that is fine.
+            // The only special case we need to avoid is treating the missing-argument default (1.0)
+            // as an explicit 1.0, which is acceptable because they produce the same result.
+            {
+                double cli_multiplier = 1.0;
+                const auto* fm_opt = m_config.option<ConfigOptionFloat>("flushing_multiplier");
+                if (fm_opt && fm_opt->value >= 0.0)
+                    cli_multiplier = fm_opt->value;
+                std::vector<double>& flush_multipliers = m_print_config.option<ConfigOptionFloats>("flush_multiplier", true)->values;
+                flush_multipliers.assign(new_extruder_count, cli_multiplier);
+                BOOST_LOG_TRIVIAL(info) << boost::format("flushing_multiplier set to %1% for all %2% extruder(s)") % cli_multiplier % new_extruder_count;
+            }
 
             std::vector<int> nozzle_flush_dataset(new_extruder_count, 0);
             {
@@ -4469,6 +4569,11 @@ int CLI::run(int argc, char **argv)
                 }
             m_models.clear();
             m_models.emplace_back(std::move(m));
+            // m_models was reallocated: update PartPlateList and all plate model pointers.
+            partplate_list.set_model(&m_models[0]);
+            // Register the assembled object with plate 0 so that duplicate_all_instance
+            // (called later for --repetitions) finds it in obj_to_instance_set.
+            partplate_list.reload_all_objects(false, -1);
         }
         else if (opt_key == "repetitions") {
             int repetitions_count = m_config.option<ConfigOptionInt>("repetitions")->value;
@@ -4477,12 +4582,10 @@ int CLI::run(int argc, char **argv)
                 BOOST_LOG_TRIVIAL(info) << "invalid repetitions value " << repetitions_count << ", just skip\n";
             }
             else {
-                if (plate_to_slice == 0) {
-                    BOOST_LOG_TRIVIAL(error) << "Invalid params: can not set repetitions when slice all." << std::endl;
-                    record_exit_reson(outfile_dir, CLI_INVALID_PARAMS, 0, cli_errors[CLI_INVALID_PARAMS], sliced_info);
-                    flush_and_exit(CLI_INVALID_PARAMS);
-                }
-                else if (plate_to_slice > partplate_list.get_plate_count()) {
+                // --slice 0 means "slice all plates". When used together with --assemble,
+                // all assembled objects end up on a single plate, so slicing all plates is
+                // equivalent to slicing that one plate. Allow the combination.
+                if (plate_to_slice != 0 && plate_to_slice > partplate_list.get_plate_count()) {
                     BOOST_LOG_TRIVIAL(error) << boost::format("Invalid params:invalid plate %1% to slice, total %2%")%plate_to_slice %partplate_list.get_plate_count();
                     record_exit_reson(outfile_dir, CLI_INVALID_PARAMS, 0, cli_errors[CLI_INVALID_PARAMS], sliced_info);
                     flush_and_exit(CLI_INVALID_PARAMS);
@@ -4791,6 +4894,14 @@ int CLI::run(int argc, char **argv)
         if (duplicate_count > 0)
             need_arrange = true;
     }
+    else {
+        // plate_to_slice == 0: slice all plates.
+        // When --assemble + --repetitions is used, the assembled object is placed on
+        // plate 1 and we are asked to slice all plates – effectively the same as
+        // slicing that single plate.  Enable arrange so the clones are laid out.
+        if (duplicate_count > 0)
+            need_arrange = true;
+    }
 
     if ((!need_arrange) && is_bbl_3mf && !shrink_to_new_bed && (plate_to_slice > 0))
     {
@@ -4958,7 +5069,12 @@ int CLI::run(int argc, char **argv)
                 arrange_cfg.nozzle_height = nozzle_height;
                 arrange_cfg.align_center = align_center;
                 arrange_cfg.printable_height = print_height;
-                arrange_cfg.min_obj_distance = 0;
+                // Apply --object-distance if provided; 0 means auto (determined by update_arrange_params)
+                {
+                    const auto* od_opt = m_config.option<ConfigOptionFloat>("object_distance");
+                    arrange_cfg.min_obj_distance = (od_opt && od_opt->value > 0.0)
+                        ? scaled<coord_t>(od_opt->value) : 0;
+                }
                 if (arrange_cfg.is_seq_print) {
                     arrange_cfg.bed_shrink_x = BED_SHRINK_SEQ_PRINT;
                     arrange_cfg.bed_shrink_y = BED_SHRINK_SEQ_PRINT;
@@ -4968,6 +5084,7 @@ int CLI::run(int argc, char **argv)
                 }
 
                 arrangement::update_arrange_params(arrange_cfg, &m_print_config, selected);
+
                 arrangement::update_selected_items_inflation(selected, &m_print_config, arrange_cfg);
                 arrangement::update_unselected_items_inflation(unselected, &m_print_config, arrange_cfg);
                 arrangement::update_selected_items_axis_align(selected, &m_print_config, arrange_cfg);
@@ -5132,7 +5249,10 @@ int CLI::run(int argc, char **argv)
                         }
                     }
 
-                    cur_plate = (Slic3r::GUI::PartPlate *)partplate_list.get_plate(plate_to_slice-1);
+                    // plate_to_slice==0 means "all plates"; for assemble+repetitions the
+                    // assembled object always lives on plate 0 (index 0), so use that.
+                    int dup_plate_idx = (plate_to_slice > 0) ? (plate_to_slice - 1) : 0;
+                    cur_plate = (Slic3r::GUI::PartPlate *)partplate_list.get_plate(dup_plate_idx);
                     cur_plate->duplicate_all_instance(duplicate_count, need_skip, skip_maps);
                 }
                 else if (plate_to_slice > 0)
@@ -5145,7 +5265,8 @@ int CLI::run(int argc, char **argv)
                 }
 
                 //Step-1: prepare arrange polygons
-                if ((duplicate_count == 0) && (plate_to_slice == 0))
+                // plate_to_slice==0 means arrange globally regardless of duplicate_count
+                if (plate_to_slice == 0)
                 {
                     //global arrange
                     for (size_t oidx = 0; oidx < model.objects.size(); ++oidx)
@@ -5411,7 +5532,12 @@ int CLI::run(int argc, char **argv)
                 arrange_cfg.nozzle_height                       = nozzle_height;
                 arrange_cfg.align_center                        = align_center;
                 arrange_cfg.printable_height                    = print_height;
-                arrange_cfg.min_obj_distance = 0;
+                // Apply --object-distance if provided; 0 means auto (determined by update_arrange_params)
+                {
+                    const auto* od_opt = m_config.option<ConfigOptionFloat>("object_distance");
+                    arrange_cfg.min_obj_distance = (od_opt && od_opt->value > 0.0)
+                        ? scaled<coord_t>(od_opt->value) : 0;
+                }
                 if (arrange_cfg.is_seq_print) {
                     arrange_cfg.bed_shrink_x = BED_SHRINK_SEQ_PRINT;
                     arrange_cfg.bed_shrink_y = BED_SHRINK_SEQ_PRINT;
@@ -5530,17 +5656,20 @@ int CLI::run(int argc, char **argv)
                         partplate_list.rebuild_plates_after_arrangement();
                 }
                 else {
-                    //only for partplate case
-                    partplate_list.clear(false, false, true, plate_to_slice-1);
+                    // duplicate_count > 0: arrange the duplicates onto a specific plate.
+                    // plate_to_slice==0 means "all plates"; for assemble+repetitions the
+                    // target plate is always plate 0 (index 0).
+                    int dup_target_plate = (plate_to_slice > 0) ? (plate_to_slice - 1) : 0;
+                    partplate_list.clear(false, false, true, dup_target_plate);
 
                     //BBS: adjust the bed_index, create new plates, get the max bed_index
                     bool failed_this_time = false;
                     for (ArrangePolygon& ap : selected) {
                         partplate_list.postprocess_bed_index_for_current_plate(ap);
-                        if (ap.bed_idx != (plate_to_slice-1))
+                        if (ap.bed_idx != dup_target_plate)
                         {
                             //
-                            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format(":arrange failed: ap.name %1% ap.bed_idx %2%, plate index %3%")% ap.name % ap.bed_idx % (plate_to_slice-1);
+                            BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format(":arrange failed: ap.name %1% ap.bed_idx %2%, plate index %3%")% ap.name % ap.bed_idx % dup_target_plate;
                             if (!duplicate_single_object)
                             {
                                 BOOST_LOG_TRIVIAL(warning) << boost::format("arrange failed when duplicate multiple objects at count %1%, low_duplicate_count %2%, up_duplicate_count %3%")%duplicate_count %low_duplicate_count %up_duplicate_count;
@@ -5572,7 +5701,7 @@ int CLI::run(int argc, char **argv)
                             }
                         }
                         else {
-                            BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(":arrange success: ap.name %1% ap.bed_idx %2%, plate index %3%")% ap.name % ap.bed_idx % (plate_to_slice-1);
+                            BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(":arrange success: ap.name %1% ap.bed_idx %2%, plate index %3%")% ap.name % ap.bed_idx % dup_target_plate;
                             real_duplicate_count ++;
                         }
 
@@ -5596,8 +5725,8 @@ int CLI::run(int argc, char **argv)
                                 ConfigOptionFloats* wipe_x_option = m_print_config.option<ConfigOptionFloats>("wipe_tower_x", true);
                                 ConfigOptionFloats* wipe_y_option = m_print_config.option<ConfigOptionFloats>("wipe_tower_y", true);
 
-                                wipe_x_option->set_at(&wt_x_opt, plate_to_slice-1, 0);
-                                wipe_y_option->set_at(&wt_y_opt, plate_to_slice-1, 0);
+                                wipe_x_option->set_at(&wt_x_opt, dup_target_plate, 0);
+                                wipe_y_option->set_at(&wt_y_opt, dup_target_plate, 0);
                                 BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": restore wipe_tower position to {%1%, %2%}")%orig_wipe_x %orig_wipe_y;
                             }
                             BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": exit arrange process");
@@ -5623,8 +5752,8 @@ int CLI::run(int argc, char **argv)
                                 ConfigOptionFloats* wipe_x_option = m_print_config.option<ConfigOptionFloats>("wipe_tower_x", true);
                                 ConfigOptionFloats* wipe_y_option = m_print_config.option<ConfigOptionFloats>("wipe_tower_y", true);
 
-                                wipe_x_option->set_at(&wt_x_opt, plate_to_slice-1, 0);
-                                wipe_y_option->set_at(&wt_y_opt, plate_to_slice-1, 0);
+                                wipe_x_option->set_at(&wt_x_opt, dup_target_plate, 0);
+                                wipe_y_option->set_at(&wt_y_opt, dup_target_plate, 0);
                                 BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": restore wipe_tower position to {%1%, %2%}")%orig_wipe_x %orig_wipe_y;
                             }
                             BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": exit arrange process");
@@ -5697,7 +5826,7 @@ int CLI::run(int argc, char **argv)
                         BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << boost::format(":arrange m_unprintable: name: %4%, bed_id %1%, trans {%2%,%3%}") % ap.bed_idx % unscale<double>(ap.translation(X)) % unscale<double>(ap.translation(Y)) % ap.name;
                     }
 
-                    partplate_list.rebuild_plates_after_arrangement(false, true, plate_to_slice-1);
+                    partplate_list.rebuild_plates_after_arrangement(false, true, dup_target_plate);
                 }
                 finished_arrange = true;
             }
@@ -5715,6 +5844,170 @@ int CLI::run(int argc, char **argv)
         for (auto &model : m_models)
             for (auto &o : model.objects)
                 o->ensure_on_bed();
+    }
+
+    // ---------------------------------------------------------------------------
+    // OpenGL / thumbnail render context – initialised once, reused for both
+    // gcode thumbnails (inline during export_gcode) and 3mf thumbnails (after
+    // the slicing loop).
+    // ---------------------------------------------------------------------------
+    struct ThumbnailRenderCtx {
+        bool                  valid         = false;
+        GLFWwindow*           window        = nullptr;
+        GUI::OpenGLManager    opengl_mgr;
+        GLVolumeCollection    glvolumes;
+        GLShaderProgram*      shader        = nullptr;
+        std::vector<ColorRGBA> colors_out;
+
+        void clear() {
+            glvolumes.clear();
+            colors_out.clear();
+            // Do NOT clear shader – it is set once during init and reused
+        }
+    };
+    ThumbnailRenderCtx thumb_ctx;
+
+    // Initialise OpenGL early so that export_gcode can embed gcode thumbnails.
+    {
+        int gl_major, gl_minor, gl_verbos;
+        glfwGetVersion(&gl_major, &gl_minor, &gl_verbos);
+        // On Linux, GLFW built with Wayland support will attempt to connect to a
+        // Wayland compositor even when WAYLAND_DISPLAY is empty, by probing
+        // $XDG_RUNTIME_DIR/wayland-0 directly.  This causes glfwInit() to fail on
+        // X11-only sessions.  Work around this by temporarily redirecting
+        // XDG_RUNTIME_DIR to an empty directory so GLFW finds no Wayland socket
+        // and falls back to X11.
+#if defined(__linux__) || defined(__LINUX__)
+        const char* saved_xdg    = getenv("XDG_RUNTIME_DIR");
+        const char* saved_wayland = getenv("WAYLAND_DISPLAY");
+        // Only redirect if we are on an X11 session and have no Wayland display
+        bool force_x11 = (saved_wayland == nullptr || saved_wayland[0] == '\0');
+        char tmp_xdg_dir[] = "/tmp/orca_cli_xdg_XXXXXX";
+        if (force_x11) {
+            if (mkdtemp(tmp_xdg_dir))
+                setenv("XDG_RUNTIME_DIR", tmp_xdg_dir, 1);
+        }
+#endif
+        glfwSetErrorCallback(glfw_callback);
+        int glfw_ret = glfwInit();
+#if defined(__linux__) || defined(__LINUX__)
+        // Restore XDG_RUNTIME_DIR after init so rest of program is unaffected
+        if (force_x11) {
+            if (saved_xdg) setenv("XDG_RUNTIME_DIR", saved_xdg, 1);
+            else unsetenv("XDG_RUNTIME_DIR");
+            rmdir(tmp_xdg_dir);
+        }
+#endif
+        if (glfw_ret == GLFW_FALSE) {
+            const char* glfw_err_msg = nullptr;
+            int glfw_err_code = glfwGetError(&glfw_err_msg);
+            BOOST_LOG_TRIVIAL(warning) << "glfwInit failed (code=" << glfw_err_code
+                << " msg=" << (glfw_err_msg ? glfw_err_msg : "none")
+                << ") – gcode thumbnails will be skipped";
+        } else {
+            glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, gl_major);
+            glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, gl_minor);
+            glfwWindowHint(GLFW_RED_BITS,   8);
+            glfwWindowHint(GLFW_GREEN_BITS, 8);
+            glfwWindowHint(GLFW_BLUE_BITS,  8);
+            glfwWindowHint(GLFW_ALPHA_BITS, 8);
+            glfwWindowHint(GLFW_VISIBLE, false);
+#ifdef __WXMAC__
+            glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+            glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
+#else
+            glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_COMPAT_PROFILE);
+#endif
+            thumb_ctx.window = glfwCreateWindow(640, 480, "base_window", NULL, NULL);
+            if (thumb_ctx.window == NULL) {
+                BOOST_LOG_TRIVIAL(warning) << "Failed to create GLFW window – gcode thumbnails will be skipped";
+            } else {
+                glfwMakeContextCurrent(thumb_ctx.window);
+                if (thumb_ctx.opengl_mgr.init_gl(false)) {
+                    thumb_ctx.valid  = true;
+                    thumb_ctx.shader = thumb_ctx.opengl_mgr.get_shader("thumbnail");
+                    BOOST_LOG_TRIVIAL(info) << "OpenGL initialised for thumbnail rendering";
+                } else {
+                    BOOST_LOG_TRIVIAL(warning) << "init_gl failed – gcode thumbnails will be skipped";
+                }
+            }
+        }
+    }
+
+    // Helper: (re)build the GLVolumeCollection from the current model state and
+    // filament colours.  Called before every thumbnail render so the volumes
+    // reflect any changes made by --assemble / --repetitions.
+    auto rebuild_glvolumes = [&]() {
+        thumb_ctx.clear();
+        if (!thumb_ctx.valid) return;
+        const auto* filament_color = dynamic_cast<const ConfigOptionStrings*>(m_print_config.option("filament_colour"));
+        // Build color list
+        std::vector<std::string> colors;
+        if (filament_color)
+            colors = filament_color->vserialize();
+        else
+            colors.push_back("#FFFFFFFF");
+        thumb_ctx.colors_out.resize(colors.size());
+        unsigned char rgb[4] = {};
+        for (size_t ci = 0; ci < colors.size(); ++ci) {
+            Slic3r::GUI::BitmapCache::parse_color4(colors[ci], rgb);
+            thumb_ctx.colors_out[ci] = ColorRGBA(rgb[0]/255.f, rgb[1]/255.f, rgb[2]/255.f, rgb[3]/255.f);
+        }
+        // Build volume collection
+        Model &model = m_models[0];
+        int obj_extruder_id = 1, vol_extruder_id = 1;
+        for (unsigned int oi = 0; oi < (unsigned int)model.objects.size(); ++oi) {
+            const ModelObject &mo = *model.objects[oi];
+            const ConfigOption *opt = mo.config.option("extruder");
+            obj_extruder_id = opt ? dynamic_cast<const ConfigOptionInt*>(opt)->getInt() : 1;
+            for (int vi = 0; vi < (int)mo.volumes.size(); ++vi) {
+                const ModelVolume &mv = *mo.volumes[vi];
+                opt = mv.config.option("extruder");
+                vol_extruder_id = opt ? dynamic_cast<const ConfigOptionInt*>(opt)->getInt() : obj_extruder_id;
+                for (int ii = 0; ii < (int)mo.instances.size(); ++ii) {
+                    thumb_ctx.glvolumes.load_object_volume(&mo, oi, vi, ii, "volume", true, false, true);
+                    std::string color = filament_color ? filament_color->get_at(vol_extruder_id - 1) : "#00FF00FF";
+                    Slic3r::GUI::BitmapCache::parse_color4(color, rgb);
+                    ColorRGBA c(rgb[0]/255.f, rgb[1]/255.f, rgb[2]/255.f, rgb[3]/255.f);
+                    thumb_ctx.glvolumes.volumes.back()->set_render_color(c);
+                    thumb_ctx.glvolumes.volumes.back()->set_color(c);
+                    thumb_ctx.glvolumes.volumes.back()->printable = mo.instances[ii]->printable;
+                }
+            }
+        }
+    };
+
+    // Build the gcode ThumbnailsGeneratorCallback using the shared OpenGL ctx.
+    // The callback is invoked by GCode::_do_export for every requested size.
+    ThumbnailsGeneratorCallback gcode_thumbnail_cb = nullptr;
+    if (thumb_ctx.valid && thumb_ctx.shader) {
+        gcode_thumbnail_cb = [&](const ThumbnailsParams& params) -> ThumbnailsList {
+            ThumbnailsList result;
+            for (const Vec2d& size : params.sizes) {
+                ThumbnailData td;
+                unsigned int w = (unsigned int)std::round(size.x());
+                unsigned int h = (unsigned int)std::round(size.y());
+                switch (GUI::OpenGLManager::get_framebuffers_type()) {
+                    case GUI::OpenGLManager::EFramebufferType::Arb:
+                        GUI::GLCanvas3D::render_thumbnail_framebuffer(td, w, h, params,
+                            partplate_list, m_models[0].objects,
+                            thumb_ctx.glvolumes, thumb_ctx.colors_out,
+                            thumb_ctx.shader, GUI::Camera::EType::Ortho);
+                        break;
+                    case GUI::OpenGLManager::EFramebufferType::Ext:
+                        GUI::GLCanvas3D::render_thumbnail_framebuffer_ext(td, w, h, params,
+                            partplate_list, m_models[0].objects,
+                            thumb_ctx.glvolumes, thumb_ctx.colors_out,
+                            thumb_ctx.shader, GUI::Camera::EType::Ortho);
+                        break;
+                    default:
+                        break;
+                }
+                if (td.is_valid())
+                    result.push_back(std::move(td));
+            }
+            return result;
+        };
     }
 
     // loop through action options
@@ -6491,8 +6784,11 @@ int CLI::run(int argc, char **argv)
                                         part_plate->set_tmp_gcode_path(outfile);
                                     }
                                     BOOST_LOG_TRIVIAL(info) << "process finished, will export gcode temporarily to " << outfile << std::endl;
+                                    // Rebuild GLVolumeCollection so the thumbnail callback reflects
+                                    // the current model (important after --assemble/--repetitions).
+                                    rebuild_glvolumes();
                                     temp_time = (long long)Slic3r::Utils::get_current_time_utc();
-                                    outfile = print_fff->export_gcode(outfile, gcode_result, nullptr);
+                                    outfile = print_fff->export_gcode(outfile, gcode_result, gcode_thumbnail_cb);
                                     time_using_cache = time_using_cache + ((long long)Slic3r::Utils::get_current_time_utc() - temp_time);
                                     BOOST_LOG_TRIVIAL(info) << "export_gcode finished: time_using_cache update to " << time_using_cache << " secs.";
                                     if (gcode_result && gcode_result->gcode_check_result.error_code) {
@@ -6770,125 +7066,19 @@ int CLI::run(int argc, char **argv)
         }
 
         if (need_regenerate_thumbnail || need_regenerate_no_light_thumbnail || need_regenerate_top_thumbnail) {
-            std::vector<std::string> colors;
-            if (filament_color) {
-                colors= filament_color->vserialize();
-            }
-            else
-                colors.push_back("#FFFFFFFF");
+            // Reuse the OpenGL context initialised before the slicing loop.
+            // Rebuild GLVolumeCollection to reflect the final model state.
+            rebuild_glvolumes();
 
-            std::vector<ColorRGBA> colors_out(colors.size());
-            unsigned char rgb_color[4] = {};
-            for (const std::string& color : colors) {
-                Slic3r::GUI::BitmapCache::parse_color4(color, rgb_color);
-                size_t color_idx = &color - &colors.front();
-                colors_out[color_idx] = ColorRGBA(float(rgb_color[0]) / 255.f, float(rgb_color[1]) / 255.f, float(rgb_color[2]) / 255.f, float(rgb_color[3]) / 255.f);
-            }
-
-            int gl_major, gl_minor, gl_verbos;
-            glfwGetVersion(&gl_major, &gl_minor, &gl_verbos);
-            BOOST_LOG_TRIVIAL(info) << boost::format("opengl version %1%.%2%.%3%")%gl_major %gl_minor %gl_verbos;
-
-            bool thumbnail_opengl_ready = false;
-            glfwSetErrorCallback(glfw_callback);
-            int ret = glfwInit();
-            if (ret == GLFW_FALSE) {
-                const char* error_msg;
-                int code = glfwGetError(&error_msg);
-                BOOST_LOG_TRIVIAL(error) << "glfwInit return error, Error code: " << code << ", Error: " << error_msg << std::endl;
-            }
-            else {
-                BOOST_LOG_TRIVIAL(info) << "glfwInit Success."<< std::endl;
-                glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, gl_major);
-                glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, gl_minor);
-                glfwWindowHint(GLFW_RED_BITS, 8);
-                glfwWindowHint(GLFW_GREEN_BITS, 8);
-                glfwWindowHint(GLFW_BLUE_BITS, 8);
-                glfwWindowHint(GLFW_ALPHA_BITS, 8);
-                glfwWindowHint(GLFW_VISIBLE, false);
-                //glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-                //glfwDisable(GLFW_AUTO_POLL_EVENTS);
-#ifdef __WXMAC__
-                glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-                glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
-#else
-                glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_COMPAT_PROFILE);
-#endif
-
-                GLFWwindow* window = glfwCreateWindow(640, 480, "base_window", NULL, NULL);
-                if (window == NULL)
-                {
-                    BOOST_LOG_TRIVIAL(error) << "Failed to create GLFW window; skipping thumbnail rendering for CLI export" << std::endl;
-                }
-                else {
-                    glfwMakeContextCurrent(window);
-                    thumbnail_opengl_ready = true;
-                }
-            }
-
-            //opengl manager related logic
-            if (!thumbnail_opengl_ready) {
-                BOOST_LOG_TRIVIAL(error) << "OpenGL context unavailable; skip thumbnail generating" << std::endl;
-                need_create_thumbnail_group = false;
-                need_create_no_light_group = false;
-                need_create_top_group = false;
-            }
-            else
-            {
-                GUI::OpenGLManager opengl_mgr;
-                bool opengl_valid = opengl_mgr.init_gl(false);
-                if (!opengl_valid) {
-                    BOOST_LOG_TRIVIAL(error) << "init opengl failed! skip thumbnail generating" << std::endl;
-                }
-                else {
-                    BOOST_LOG_TRIVIAL(info) << "gladLoadGL Success." << std::endl;
-                    GLVolumeCollection glvolume_collection;
-                    Model &model = m_models[0];
-                    int obj_extruder_id = 1, volume_extruder_id = 1;
-                    for (unsigned int obj_idx = 0; obj_idx < (unsigned int)model.objects.size(); ++ obj_idx) {
-                        const ModelObject &model_object = *model.objects[obj_idx];
-                        const ConfigOption* option = model_object.config.option("extruder");
-                        if (option)
-                            obj_extruder_id = (dynamic_cast<const ConfigOptionInt *>(option))->getInt();
-                        else
-                            obj_extruder_id = 1;
-                        for (int volume_idx = 0; volume_idx < (int)model_object.volumes.size(); ++ volume_idx) {
-                            const ModelVolume &model_volume = *model_object.volumes[volume_idx];
-                            option = model_volume.config.option("extruder");
-                            if (option)
-                                volume_extruder_id = (dynamic_cast<const ConfigOptionInt *>(option))->getInt();
-                            else
-                                volume_extruder_id = obj_extruder_id;
-
-                            BOOST_LOG_TRIVIAL(debug) << boost::format("volume %1%'s extruder_id %2%")%volume_idx %volume_extruder_id;
-                            //if (!model_volume.is_model_part())
-                            //    continue;
-                            for (int instance_idx = 0; instance_idx < (int)model_object.instances.size(); ++ instance_idx) {
-                                const ModelInstance &model_instance = *model_object.instances[instance_idx];
-                                glvolume_collection.load_object_volume(&model_object, obj_idx, volume_idx, instance_idx, "volume", true, false, true);
-                                //glvolume_collection.volumes.back()->geometry_id = key.geometry_id;
-                                std::string color = filament_color?filament_color->get_at(volume_extruder_id - 1):"#00FF00FF";
-
-                                BOOST_LOG_TRIVIAL(debug) << boost::format("volume %1%'s color %2%")%volume_idx %color;
-
-                                unsigned char  rgb_color[4] = {};
-                                Slic3r::GUI::BitmapCache::parse_color4(color, rgb_color);
-
-                                ColorRGBA new_color;
-                                new_color.r(float(rgb_color[0]) / 255.f);
-                                new_color.g(float(rgb_color[1]) / 255.f);
-                                new_color.b(float(rgb_color[2]) / 255.f);
-                                new_color.a(float(rgb_color[3]) / 255.f);
-
-                                glvolume_collection.volumes.back()->set_render_color(new_color);
-                                glvolume_collection.volumes.back()->set_color(new_color);
-                                glvolume_collection.volumes.back()->printable = model_instance.printable;
-                            }
-                        }
-                    }
+            if (!thumb_ctx.valid) {
+                BOOST_LOG_TRIVIAL(error) << "OpenGL not available – skip 3mf thumbnail generating";
+            } else {
+                Model &model                            = m_models[0];
+                GLVolumeCollection &glvolume_collection = thumb_ctx.glvolumes;
+                std::vector<ColorRGBA> &colors_out      = thumb_ctx.colors_out;
 
                     ThumbnailsParams thumbnail_params;
-                    GLShaderProgram* shader = opengl_mgr.get_shader("thumbnail");
+                    GLShaderProgram* shader = thumb_ctx.shader;
                     if (!shader) {
                         BOOST_LOG_TRIVIAL(error) << boost::format("can not get shader for rendering thumbnail");
                     }
@@ -7127,9 +7317,6 @@ int CLI::run(int argc, char **argv)
                     }
                 }
             }
-            //BBS: release glfw
-            glfwTerminate();
-        }
         else {
             BOOST_LOG_TRIVIAL(info) << boost::format("Line %1%: use previous thumbnails, no need to regenerate")%__LINE__;
             for (int i = 0; i < partplate_list.get_plate_count(); i++) {

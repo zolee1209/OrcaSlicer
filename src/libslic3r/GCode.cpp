@@ -2596,6 +2596,8 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
             m_processor.result().gcode_check_result.error_code |= (1 << 11); // printed weight over limit
         }
     }
+    // Orca custom: always dump the processed moves next to the exported gcode.
+    GCodeProcessor::export_moves_file(m_processor.get_result(), path);
     if (result != nullptr) {
         *result = std::move(m_processor.extract_result());
         // set the filename to the correct value

@@ -1243,6 +1243,10 @@ class Print;
         GCodeProcessorResult& result() { return m_result; }
         GCodeProcessorResult&& extract_result() { return std::move(m_result); }
 
+        // Orca custom: dump the processed moves into a compact binary sidecar
+        // file ("<gcode_path>.moves") for external toolpath consumers.
+        static void export_moves_file(const GCodeProcessorResult& result, const std::string& gcode_path);
+
         // Load a G-code into a stand-alone G-code viewer.
         // throws CanceledException through print->throw_if_canceled() (sent by the caller as callback).
         void process_file(const std::string& filename, std::function<void()> cancel_callback = nullptr);

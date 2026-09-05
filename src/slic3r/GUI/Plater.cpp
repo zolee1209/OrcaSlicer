@@ -2671,7 +2671,12 @@ Sidebar::Sidebar(Plater *parent)
         p->combo_nozzle_dia->SetMinSize(FromDIP(wxSize(PRINTER_PANEL_SIZE.GetWidth() - 4, 26))); // requires a static value in here
         p->combo_nozzle_dia->SetMaxSize(FromDIP(wxSize(PRINTER_PANEL_SIZE.GetWidth() - 4, 26))); // using -1 with wxEXPAND has issues
         p->combo_nozzle_dia->Bind(wxEVT_COMBOBOX, [this](auto &e) {
-            auto evt_combo = (*p->single_extruder).combo_diameter;
+            // ORCA: non-BBL dual-extruder printers (e.g. IDEX) have no per-extruder AMS UI,
+            // so the unified combo drives both nozzles at once (they always share one diameter).
+            bool is_dual = wxGetApp().preset_bundle->get_printer_extruder_count() >= 2;
+            ComboBox *evt_combo = is_dual ? p->left_extruder->combo_diameter : (*p->single_extruder).combo_diameter;
+            if (is_dual)
+                p->right_extruder->combo_diameter->SetSelection(e.GetSelection());
             evt_combo->SetSelection(e.GetSelection());
             wxCommandEvent evt(wxEVT_COMBOBOX, evt_combo->GetId());
             evt.SetEventObject(evt_combo);
@@ -3723,33 +3728,37 @@ void Sidebar::update_presets(Preset::Type preset_type)
             //if (!p->is_switching_diameter)
                 update_extruder_diameter(0, *p->single_extruder);
 
-            // ORCA sync unified nozzle combo box
+            p->image_printer_bed->SetBitmap(create_scaled_bitmap(image_path, this, PRINTER_THUMBNAIL_SIZE.GetHeight()));
+        }
+
+        // ORCA sync unified nozzle combo box (single-extruder printers, and non-BBL dual-extruder
+        // printers such as IDEX which share one diameter across both nozzles and have no AMS UI)
+        {
+            ExtruderGroup &diameter_source = is_dual_extruder ? *p->left_extruder : *p->single_extruder;
             p->combo_nozzle_dia->Clear();
             for (size_t i = 0; i < diameters.size(); ++i)
                 p->combo_nozzle_dia->Append(diameters[i], {});
-            p->combo_nozzle_dia->SetSelection((*p->single_extruder).combo_diameter->GetSelection());
-            
-            // ORCA update nozzle type
-            const auto& full_config = wxGetApp().preset_bundle->full_config();
-            wxString nozzle_type = "-";
-            const ConfigOptionEnumsGenericNullable* cfg_nozzle_type = full_config.option<ConfigOptionEnumsGenericNullable>("nozzle_type");
-            if(cfg_nozzle_type != nullptr){
-                std::vector<NozzleType> nozzle_types(cfg_nozzle_type->size());
-                for (size_t idx = 0; idx < cfg_nozzle_type->size(); ++idx)
-                    nozzle_types[idx] = NozzleType(cfg_nozzle_type->values[idx]);
-                nozzle_type = _L( // NEEDFIX this part can be replaced with shorter names
-                    nozzle_types[0] == ntHardenedSteel   ? "Hardened Steel" :
-                    nozzle_types[0] == ntStainlessSteel  ? "Stainless Steel" :
-                    nozzle_types[0] == ntTungstenCarbide ? "Tungsten Carbide" :
-                    nozzle_types[0] == ntBrass           ? "Brass"
-                                                         : "-" // Undefined
-                );
-            }
-            p->label_nozzle_type->SetLabel(nozzle_type);
-            p->label_nozzle_type->SetToolTip(nozzle_type == "-" ? "" : nozzle_type);
-
-            p->image_printer_bed->SetBitmap(create_scaled_bitmap(image_path, this, PRINTER_THUMBNAIL_SIZE.GetHeight()));
+            p->combo_nozzle_dia->SetSelection(diameter_source.combo_diameter->GetSelection());
         }
+
+        // ORCA update nozzle type
+        const auto& full_config = wxGetApp().preset_bundle->full_config();
+        wxString nozzle_type = "-";
+        const ConfigOptionEnumsGenericNullable* cfg_nozzle_type = full_config.option<ConfigOptionEnumsGenericNullable>("nozzle_type");
+        if(cfg_nozzle_type != nullptr){
+            std::vector<NozzleType> nozzle_types(cfg_nozzle_type->size());
+            for (size_t idx = 0; idx < cfg_nozzle_type->size(); ++idx)
+                nozzle_types[idx] = NozzleType(cfg_nozzle_type->values[idx]);
+            nozzle_type = _L( // NEEDFIX this part can be replaced with shorter names
+                nozzle_types[0] == ntHardenedSteel   ? "Hardened Steel" :
+                nozzle_types[0] == ntStainlessSteel  ? "Stainless Steel" :
+                nozzle_types[0] == ntTungstenCarbide ? "Tungsten Carbide" :
+                nozzle_types[0] == ntBrass           ? "Brass"
+                                                     : "-" // Undefined
+            );
+        }
+        p->label_nozzle_type->SetLabel(nozzle_type);
+        p->label_nozzle_type->SetToolTip(nozzle_type == "-" ? "" : nozzle_type);
 
         if (GUI::wxGetApp().plater())
             GUI::wxGetApp().plater()->update_machine_sync_status();
