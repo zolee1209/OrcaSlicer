@@ -8,6 +8,7 @@
 #include "FilamentMixer.hpp"
 #include "Flow.hpp"
 #include "Geometry/ConvexHull.hpp"
+#include <cstdlib>
 #include "I18N.hpp"
 #include "ShortestPath.hpp"
 #include "Thread.hpp"
@@ -4537,8 +4538,10 @@ void Print::export_gcode_from_previous_file(const std::string& file, GCodeProces
         *result = std::move(processor.extract_result());
         result->filament_change_sequence = filament_seq_loaded;
         result->nozzle_change_sequence   = nozzle_seq_loaded;
-        // Orca custom: dump the processed moves next to the source gcode file.
-        GCodeProcessor::export_moves_file(*result, file);
+        // Orca custom: dump the processed moves next to the source gcode file
+        // (same ORCA_SKIP_MOVES_EXPORT opt-out as GCode::do_export()).
+        if (!std::getenv("ORCA_SKIP_MOVES_EXPORT"))
+            GCodeProcessor::export_moves_file(*result, file);
     } catch (std::exception & /* ex */) {
         BOOST_LOG_TRIVIAL(error) << __FUNCTION__ <<  boost::format(": found errors when process gcode file %1%") %file.c_str();
         throw Slic3r::RuntimeError(

@@ -591,11 +591,27 @@ if [[ -n "${NATIVE_OPTIMIZED}" ]] ; then
     # auto-detecting ld.lld-20 (which Clang 20 ships alongside and CMake
     # prefers when it finds the llvm toolchain).
     GOLD_BIN=$(command -v ld.gold)
+
+    # --- Allocator override: jemalloc ---
+    # Slicing is heavily multi-threaded (TBB parallel_for over Clipper polygon
+    # ops); glibc's per-thread arena malloc contends under this pattern on a
+    # 2-socket/40-core NUMA box. jemalloc's interposition (exporting
+    # malloc/free/... ) is a link-only change, no source changes needed.
+    # Linked by exact soname (-l:libjemalloc.so.2) so no libjemalloc-dev
+    # (.so symlink) package is required, only the already-present runtime lib.
+    JEMALLOC_LDFLAGS=""
+    if ldconfig -p 2>/dev/null | grep -q 'libjemalloc\.so\.2'; then
+        JEMALLOC_LDFLAGS="-l:libjemalloc.so.2"
+        echo ">>> Allocator  : jemalloc (libjemalloc.so.2 found)"
+    else
+        echo ">>> Allocator  : glibc default (libjemalloc.so.2 not found, install libjemalloc2 to enable)"
+    fi
+
     NATIVE_OPT_CFLAGS=(
         "-DCMAKE_LINKER=${GOLD_BIN}"
         "-DCMAKE_C_FLAGS_RELEASE=-O3 ${ARCH_FLAGS} ${LTO_FLAGS} ${EXTRA_FLAGS} -DNDEBUG"
         "-DCMAKE_CXX_FLAGS_RELEASE=-O3 ${ARCH_FLAGS} ${LTO_FLAGS} ${EXTRA_FLAGS} -DNDEBUG"
-        "-DCMAKE_EXE_LINKER_FLAGS_RELEASE=${LTO_FLAGS} ${STATIC_RUNTIME_LDFLAGS} ${LINKER_FLAG}"
+        "-DCMAKE_EXE_LINKER_FLAGS_RELEASE=${LTO_FLAGS} ${STATIC_RUNTIME_LDFLAGS} ${LINKER_FLAG} ${JEMALLOC_LDFLAGS}"
         "-DCMAKE_SHARED_LINKER_FLAGS_RELEASE=${LTO_FLAGS} ${LINKER_FLAG}"
         "-DCMAKE_MODULE_LINKER_FLAGS_RELEASE=${LTO_FLAGS} ${LINKER_FLAG}"
     )
