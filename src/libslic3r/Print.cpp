@@ -9,6 +9,7 @@
 #include "Flow.hpp"
 #include "Geometry/ConvexHull.hpp"
 #include <cstdlib>
+#include <atomic>
 #include "I18N.hpp"
 #include "ShortestPath.hpp"
 #include "Thread.hpp"
@@ -5035,26 +5036,8 @@ static void read_entity_collection_fields(Reader& r, ExtrusionEntityCollection& 
     for (uint32_t i = 0; i < n; ++i) read_extrusion_entity(r, coll);
 }
 
-static void write_layer_region(Writer& w, const LayerRegion& lr) {
-    w.u64((uint64_t)lr.region().config_hash());
-    w.u32((uint32_t)lr.slices.surfaces.size());
-    for (const Surface& s : lr.slices.surfaces) write_surface(w, s);
-    w.u32((uint32_t)lr.raw_slices.size());
-    for (const ExPolygon& p : lr.raw_slices) write_expolygon(w, p);
-    write_entity_collection_fields(w, lr.thin_fills);
-    w.u32((uint32_t)lr.fill_expolygons.size());
-    for (const ExPolygon& p : lr.fill_expolygons) write_expolygon(w, p);
-    w.u32((uint32_t)lr.fill_surfaces.surfaces.size());
-    for (const Surface& s : lr.fill_surfaces.surfaces) write_surface(w, s);
-    w.u32((uint32_t)lr.fill_no_overlap_expolygons.size());
-    for (const ExPolygon& p : lr.fill_no_overlap_expolygons) write_expolygon(w, p);
-    w.u32((uint32_t)lr.unsupported_bridge_edges.size());
-    for (const Polyline& pl : lr.unsupported_bridge_edges) write_polyline(w, pl);
-    write_entity_collection_fields(w, lr.perimeters);
-    write_entity_collection_fields(w, lr.fills);
-}
-// NOTE: config_hash is written first by write_layer_region() above, but it is consumed by the
-// caller (to resolve the PrintRegion* and call add_region()) before this body is read.
+// NOTE: config_hash is written separately by the caller (write_layer_geom_and_regions_block) to
+// resolve the PrintRegion*/call add_region() before this body is read back.
 static void read_layer_region_body(Reader& r, LayerRegion& lr) {
     uint32_t n;
     n = r.u32(); for (uint32_t i = 0; i < n; ++i) { Surface s; read_surface(r, s); lr.slices.surfaces.push_back(std::move(s)); }
@@ -5094,26 +5077,7 @@ static const PrintRegion* find_region_by_hash(PrintObject* object, uint64_t conf
     return NULL;
 }
 
-// Shared by normal layers and support layers: lslices/bboxes/overhangs/overhang_bbox + regions.
-// Called after the layer object itself already exists (add_layer()/add_support_layer() need the
-// header fields print_z/height/slice_z/id[/interface_id] up front, so those are read by the caller).
-static void read_layer_geometry_and_regions(Reader& r, PrintObject* obj, Layer* layer, const std::string& obj_name) {
-    uint32_t n;
-    n = r.u32(); for (uint32_t i = 0; i < n; ++i) { ExPolygon p; read_expolygon(r, p); layer->lslices.push_back(std::move(p)); }
-    n = r.u32(); for (uint32_t i = 0; i < n; ++i) { BoundingBox b; read_bbox(r, b); layer->lslices_bboxes.push_back(std::move(b)); }
-    n = r.u32(); for (uint32_t i = 0; i < n; ++i) { ExPolygon p; read_expolygon(r, p); layer->loverhangs.push_back(std::move(p)); }
-    read_bbox(r, layer->loverhangs_bbox);
-    uint32_t region_count = r.u32();
-    for (uint32_t ri = 0; ri < region_count; ++ri) {
-        uint64_t config_hash = r.u64();
-        const PrintRegion* pr = find_region_by_hash(obj, config_hash);
-        if (!pr)
-            throw Slic3r::FileIOError("slice cache: region config_hash not found for object " + obj_name);
-        LayerRegion* nr = layer->add_region(pr);
-        read_layer_region_body(r, *nr);
-    }
-}
-static void write_layer_geometry_and_regions(Writer& w, const Layer& layer) {
+static void write_layer_geometry_only(Writer& w, const Layer& layer) {
     w.u32((uint32_t)layer.lslices.size());
     for (const ExPolygon& p : layer.lslices) write_expolygon(w, p);
     w.u32((uint32_t)layer.lslices_bboxes.size());
@@ -5121,8 +5085,83 @@ static void write_layer_geometry_and_regions(Writer& w, const Layer& layer) {
     w.u32((uint32_t)layer.loverhangs.size());
     for (const ExPolygon& p : layer.loverhangs) write_expolygon(w, p);
     write_bbox(w, layer.loverhangs_bbox);
+}
+static void read_layer_geometry_only(Reader& r, Layer& layer) {
+    uint32_t n;
+    n = r.u32(); for (uint32_t i = 0; i < n; ++i) { ExPolygon p; read_expolygon(r, p); layer.lslices.push_back(std::move(p)); }
+    n = r.u32(); for (uint32_t i = 0; i < n; ++i) { BoundingBox b; read_bbox(r, b); layer.lslices_bboxes.push_back(std::move(b)); }
+    n = r.u32(); for (uint32_t i = 0; i < n; ++i) { ExPolygon p; read_expolygon(r, p); layer.loverhangs.push_back(std::move(p)); }
+    read_bbox(r, layer.loverhangs_bbox);
+}
+
+// ORCA: each layer's per-region content and geometry blob is wrapped with an explicit byte
+// length, so a lightweight *sequential* first pass (add_layer()/add_region() must run in order,
+// they mutate PrintObject's shared layer/region vectors) can walk the whole object skipping over
+// the actual heavy data without parsing it, recording (pointer, offset, length) "jobs". Those jobs
+// are then parsed by an arbitrary number of worker threads in a second, fully parallel pass --
+// restoring (and, since it's now per-region rather than just per-layer, actually improving on) the
+// parallelism the old JSON format got "for free" by having the whole file already parsed as a tree.
+struct GeomJob { Layer* layer; size_t offset; uint32_t length; };
+struct RegionJob { LayerRegion* region; size_t offset; uint32_t length; };
+struct SupportExtraJob { SupportLayer* layer; size_t offset; uint32_t length; };
+
+static void write_layer_region_content(Writer& w, const LayerRegion& lr) {
+    uint32_t n;
+    w.u32((uint32_t)lr.slices.surfaces.size());
+    for (const Surface& s : lr.slices.surfaces) write_surface(w, s);
+    w.u32((uint32_t)lr.raw_slices.size());
+    for (const ExPolygon& p : lr.raw_slices) write_expolygon(w, p);
+    write_entity_collection_fields(w, lr.thin_fills);
+    w.u32((uint32_t)lr.fill_expolygons.size());
+    for (const ExPolygon& p : lr.fill_expolygons) write_expolygon(w, p);
+    w.u32((uint32_t)lr.fill_surfaces.surfaces.size());
+    for (const Surface& s : lr.fill_surfaces.surfaces) write_surface(w, s);
+    w.u32((uint32_t)lr.fill_no_overlap_expolygons.size());
+    for (const ExPolygon& p : lr.fill_no_overlap_expolygons) write_expolygon(w, p);
+    w.u32((uint32_t)lr.unsupported_bridge_edges.size());
+    for (const Polyline& pl : lr.unsupported_bridge_edges) write_polyline(w, pl);
+    write_entity_collection_fields(w, lr.perimeters);
+    write_entity_collection_fields(w, lr.fills);
+    (void)n;
+}
+
+// Writes: geom_length + geom bytes, region_count, then per region (hash, body_length, body bytes).
+static void write_layer_geom_and_regions_block(Writer& w, const Layer& layer) {
+    Writer geom;
+    write_layer_geometry_only(geom, layer);
+    w.u32((uint32_t)geom.buf.size());
+    w.buf.insert(w.buf.end(), geom.buf.begin(), geom.buf.end());
+
     w.u32((uint32_t)layer.regions().size());
-    for (const LayerRegion* lr : layer.regions()) write_layer_region(w, *lr);
+    for (const LayerRegion* lr : layer.regions()) {
+        w.u64((uint64_t)lr->region().config_hash());
+        Writer body;
+        write_layer_region_content(body, *lr);
+        w.u32((uint32_t)body.buf.size());
+        w.buf.insert(w.buf.end(), body.buf.begin(), body.buf.end());
+    }
+}
+
+// Sequential skip-only pass over one layer's geom+region block; queues jobs, does not parse.
+static bool skip_layer_geom_and_regions_block(Reader& r, const uint8_t* base, PrintObject* obj, Layer* layer,
+                                               std::vector<GeomJob>& geom_jobs, std::vector<RegionJob>& region_jobs) {
+    uint32_t geom_len = r.u32();
+    geom_jobs.push_back({layer, (size_t)(r.ptr - base), geom_len});
+    if (r.ptr + geom_len > r.end) return false;
+    r.ptr += geom_len;
+
+    uint32_t region_count = r.u32();
+    for (uint32_t ri = 0; ri < region_count; ++ri) {
+        uint64_t config_hash = r.u64();
+        const PrintRegion* pr = find_region_by_hash(obj, config_hash);
+        if (!pr) return false;
+        LayerRegion* nr = layer->add_region(pr);
+        uint32_t region_len = r.u32();
+        region_jobs.push_back({nr, (size_t)(r.ptr - base), region_len});
+        if (r.ptr + region_len > r.end) return false;
+        r.ptr += region_len;
+    }
+    return true;
 }
 
 } // namespace SliceCacheBin
@@ -5179,32 +5218,63 @@ int Print::export_cached_data(const std::string& directory, bool with_space)
                     w.str(entries[e_index].name);
                     w.u64((uint64_t)entries[e_index].identify_id);
 
-                    //export the layers
+                    //export the layers: each layer's geometry+regions blob is built independently,
+                    //so building them can be parallelized (matches per-layer JSON parallelism, plus
+                    //this also parallelizes each layer's regions since they get their own blob too).
+                    std::vector<std::vector<uint8_t>> layer_blocks(obj->layer_count());
+                    tbb::parallel_for(
+                        tbb::blocked_range<size_t>(0, obj->layer_count()),
+                        [obj, &layer_blocks](const tbb::blocked_range<size_t>& layer_range) {
+                            for (size_t li = layer_range.begin(); li < layer_range.end(); ++li) {
+                                const Layer* layer = obj->get_layer((int)li);
+                                Writer lw;
+                                write_layer_geom_and_regions_block(lw, *layer);
+                                layer_blocks[li] = std::move(lw.buf);
+                            }
+                        }
+                    );
                     w.u32((uint32_t)obj->layer_count());
-                    for (int l_index = 0; l_index < (int)obj->layer_count(); ++l_index) {
-                        const Layer *layer = obj->get_layer(l_index);
+                    for (int li = 0; li < (int)obj->layer_count(); ++li) {
+                        const Layer* layer = obj->get_layer(li);
                         w.f64(layer->print_z);
                         w.f64(layer->height);
                         w.f64(layer->slice_z);
                         w.u64((uint64_t)layer->id());
-                        write_layer_geometry_and_regions(w, *layer);
+                        w.buf.insert(w.buf.end(), layer_blocks[li].begin(), layer_blocks[li].end());
                     }
+                    layer_blocks.clear();
 
-                    //export the support layers
+                    //export the support layers, same per-layer parallel blob building
+                    std::vector<std::vector<uint8_t>> support_blocks(obj->support_layer_count());
+                    tbb::parallel_for(
+                        tbb::blocked_range<size_t>(0, obj->support_layer_count()),
+                        [obj, &support_blocks](const tbb::blocked_range<size_t>& support_layer_range) {
+                            for (size_t si = support_layer_range.begin(); si < support_layer_range.end(); ++si) {
+                                const SupportLayer* support_layer = obj->get_support_layer((int)si);
+                                Writer sw;
+                                write_layer_geom_and_regions_block(sw, *support_layer);
+                                sw.u8((uint8_t)support_layer->support_type);
+                                Writer extra;
+                                extra.u32((uint32_t)support_layer->support_islands.size());
+                                for (const ExPolygon& island : support_layer->support_islands) write_expolygon(extra, island);
+                                write_entity_collection_fields(extra, support_layer->support_fills);
+                                sw.u32((uint32_t)extra.buf.size());
+                                sw.buf.insert(sw.buf.end(), extra.buf.begin(), extra.buf.end());
+                                support_blocks[si] = std::move(sw.buf);
+                            }
+                        }
+                    );
                     w.u32((uint32_t)obj->support_layer_count());
-                    for (int s_index = 0; s_index < (int)obj->support_layer_count(); ++s_index) {
-                        const SupportLayer *support_layer = obj->get_support_layer(s_index);
+                    for (int si = 0; si < (int)obj->support_layer_count(); ++si) {
+                        const SupportLayer* support_layer = obj->get_support_layer(si);
                         w.f64(support_layer->print_z);
                         w.f64(support_layer->height);
                         w.f64(support_layer->slice_z);
                         w.u64((uint64_t)support_layer->id());
                         w.u64((uint64_t)support_layer->interface_id());
-                        write_layer_geometry_and_regions(w, *support_layer);
-                        w.u8((uint8_t)support_layer->support_type);
-                        w.u32((uint32_t)support_layer->support_islands.size());
-                        for (const ExPolygon& island : support_layer->support_islands) write_expolygon(w, island);
-                        write_entity_collection_fields(w, support_layer->support_fills);
+                        w.buf.insert(w.buf.end(), support_blocks[si].begin(), support_blocks[si].end());
                     }
+                    support_blocks.clear();
 
                     //first layer groups (volume ids remapped to an index into the source object's volumes)
                     const std::vector<groupedVolumeSlices> &first_layer_obj_groups = obj->firstLayerObjGroups();
@@ -5334,7 +5404,8 @@ int Print::load_cached_data(const std::string& directory)
         PrintObject *obj = object_filenames[obj_index].second;
 
         try {
-            Reader r(object_data[obj_index].data(), object_data[obj_index].size());
+            const uint8_t* base = object_data[obj_index].data();
+            Reader r(base, object_data[obj_index].size());
             std::string name = r.str();
             uint64_t identify_id = r.u64();
             uint32_t layer_count = r.u32();
@@ -5342,8 +5413,18 @@ int Print::load_cached_data(const std::string& directory)
             BOOST_LOG_TRIVIAL(info) << __FUNCTION__<<boost::format(":will load %1%, identify_id %2%, layer_count %3%")
                 %name %identify_id %layer_count;
 
+            // Phase 1 (sequential, cheap): create layers/regions (mutates obj's shared vectors,
+            // must not race) and record where each layer's/region's heavy content lives in the
+            // buffer, skipping over it without parsing. Phase 2 below parses all of those jobs
+            // in parallel.
+            std::vector<GeomJob> geom_jobs;
+            std::vector<RegionJob> region_jobs;
+            std::vector<SupportExtraJob> support_extra_jobs;
+            geom_jobs.reserve(layer_count);
+
+            bool phase1_ok = true;
             Layer* previous_layer = NULL;
-            for (uint32_t l_index = 0; l_index < layer_count; l_index++)
+            for (uint32_t l_index = 0; l_index < layer_count && phase1_ok; l_index++)
             {
                 double print_z = r.f64(), height = r.f64(), slice_z = r.f64();
                 uint64_t layer_id = r.u64();
@@ -5358,19 +5439,16 @@ int Print::load_cached_data(const std::string& directory)
                 }
                 previous_layer = new_layer;
 
-                try {
-                    read_layer_geometry_and_regions(r, obj, new_layer, name);
-                }
-                catch (Slic3r::FileIOError&) {
-                    BOOST_LOG_TRIVIAL(error) <<__FUNCTION__<< boost::format(":can not find print region of object %1%, layer %2%, print_z %3%")
-                        %name % l_index %new_layer->print_z;
-                    return CLI_IMPORT_CACHE_DATA_CAN_NOT_USE;
-                }
+                phase1_ok = skip_layer_geom_and_regions_block(r, base, obj, new_layer, geom_jobs, region_jobs);
+            }
+            if (!phase1_ok) {
+                BOOST_LOG_TRIVIAL(error) <<__FUNCTION__<< boost::format(":can not find print region of object %1%, or truncated cache data")%name;
+                return CLI_IMPORT_CACHE_DATA_CAN_NOT_USE;
             }
 
             uint32_t support_layer_count = r.u32();
             Layer* previous_support_layer = NULL;
-            for (uint32_t s_index = 0; s_index < support_layer_count; s_index++)
+            for (uint32_t s_index = 0; s_index < support_layer_count && phase1_ok; s_index++)
             {
                 double print_z = r.f64(), height = r.f64(), slice_z = r.f64();
                 uint64_t layer_id = r.u64();
@@ -5386,14 +5464,20 @@ int Print::load_cached_data(const std::string& directory)
                 }
                 previous_support_layer = new_support_layer;
 
-                read_layer_geometry_and_regions(r, obj, new_support_layer, name);
+                phase1_ok = skip_layer_geom_and_regions_block(r, base, obj, new_support_layer, geom_jobs, region_jobs);
+                if (!phase1_ok) break;
                 new_support_layer->support_type = (SupportInnerType)r.u8();
-                uint32_t islands_count = r.u32();
-                for (uint32_t i = 0; i < islands_count; ++i) { ExPolygon p; read_expolygon(r, p); new_support_layer->support_islands.push_back(std::move(p)); }
-                read_entity_collection_fields(r, new_support_layer->support_fills);
+                uint32_t extra_len = r.u32();
+                support_extra_jobs.push_back({new_support_layer, (size_t)(r.ptr - base), extra_len});
+                if (r.ptr + extra_len > r.end) { phase1_ok = false; break; }
+                r.ptr += extra_len;
+            }
+            if (!phase1_ok) {
+                BOOST_LOG_TRIVIAL(error) <<__FUNCTION__<< boost::format(":can not find print region of object %1% (support layers), or truncated cache data")%name;
+                return CLI_IMPORT_CACHE_DATA_CAN_NOT_USE;
             }
 
-            //load first group volumes
+            //load first group volumes (small, kept sequential)
             uint32_t firstlayer_group_count = r.u32();
             std::vector<groupedVolumeSlices>& firstlayer_objgroups = obj->firstLayerObjGroupsMod();
             for (uint32_t index = 0; index < firstlayer_group_count; index++)
@@ -5417,6 +5501,51 @@ int Print::load_cached_data(const std::string& directory)
                     }
                 }
                 firstlayer_objgroups.push_back(std::move(firstlayer_group));
+            }
+
+            // Phase 2 (parallel): actually parse the heavy per-layer/per-region/support-extra
+            // content queued above. Each job only touches its own Layer*/LayerRegion*/
+            // SupportLayer*, so this is race-free even though it runs across many threads.
+            std::atomic<bool> parse_ok{true};
+            tbb::parallel_for(
+                tbb::blocked_range<size_t>(0, geom_jobs.size()),
+                [base, &geom_jobs, &parse_ok](const tbb::blocked_range<size_t>& jr) {
+                    for (size_t i = jr.begin(); i < jr.end(); ++i) {
+                        try {
+                            Reader gr(base + geom_jobs[i].offset, geom_jobs[i].length);
+                            read_layer_geometry_only(gr, *geom_jobs[i].layer);
+                        } catch (std::exception&) { parse_ok = false; }
+                    }
+                }
+            );
+            tbb::parallel_for(
+                tbb::blocked_range<size_t>(0, region_jobs.size()),
+                [base, &region_jobs, &parse_ok](const tbb::blocked_range<size_t>& jr) {
+                    for (size_t i = jr.begin(); i < jr.end(); ++i) {
+                        try {
+                            Reader rr(base + region_jobs[i].offset, region_jobs[i].length);
+                            read_layer_region_body(rr, *region_jobs[i].region);
+                        } catch (std::exception&) { parse_ok = false; }
+                    }
+                }
+            );
+            tbb::parallel_for(
+                tbb::blocked_range<size_t>(0, support_extra_jobs.size()),
+                [base, &support_extra_jobs, &parse_ok](const tbb::blocked_range<size_t>& jr) {
+                    for (size_t i = jr.begin(); i < jr.end(); ++i) {
+                        try {
+                            Reader er(base + support_extra_jobs[i].offset, support_extra_jobs[i].length);
+                            SupportLayer* sl = support_extra_jobs[i].layer;
+                            uint32_t islands_count = er.u32();
+                            for (uint32_t k = 0; k < islands_count; ++k) { ExPolygon p; read_expolygon(er, p); sl->support_islands.push_back(std::move(p)); }
+                            read_entity_collection_fields(er, sl->support_fills);
+                        } catch (std::exception&) { parse_ok = false; }
+                    }
+                }
+            );
+            if (!parse_ok) {
+                BOOST_LOG_TRIVIAL(error) << __FUNCTION__<< boost::format(": load from %1% failed while parsing queued layer/region jobs")%object_filenames[obj_index].first;
+                return CLI_IMPORT_CACHE_LOAD_FAILED;
             }
 
             count ++;
