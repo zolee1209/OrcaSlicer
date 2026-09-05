@@ -4773,715 +4773,367 @@ const std::string PrintStatistics::TotalFilamentUsedWipeTowerValueMask = "; tota
 #define JSON_EXTRUSION_LOOP_ROLE               "loop_role"
 
 
-static void to_json(json& j, const Points& p_s) {
-    for (const Point& p : p_s)
-    {
-        j.push_back(p.x());
-        j.push_back(p.y());
+// ORCA: slice-data cache serialization, binary format.
+//
+// This used to be nlohmann::json text serialization (see git history). Replaced with a
+// compact binary encoding for speed (no text tokenizing/formatting on either side) and size
+// (no key names, brackets or decimal-text coordinates) -- both of which dominated wall-clock
+// time over the actual geometry recompute saved by the cache on large/complex objects.
+// Same object model as before, only the encoding differs.
+namespace SliceCacheBin {
+
+class Writer {
+public:
+    std::vector<uint8_t> buf;
+    template<class T> void raw(const T& v) {
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(&v);
+        buf.insert(buf.end(), p, p + sizeof(T));
+    }
+    void i32(int32_t v) { raw(v); }
+    void i64(int64_t v) { raw(v); }
+    void u64(uint64_t v) { raw(v); }
+    void u32(uint32_t v) { raw(v); }
+    void u8(uint8_t v) { raw(v); }
+    void f64(double v) { raw(v); }
+    void f32(float v) { raw(v); }
+    void boolean(bool v) { u8(v ? 1 : 0); }
+    void str(const std::string& s) {
+        u32((uint32_t)s.size());
+        buf.insert(buf.end(), s.begin(), s.end());
+    }
+};
+
+class Reader {
+public:
+    const uint8_t* ptr;
+    const uint8_t* end;
+    Reader(const uint8_t* p, size_t n) : ptr(p), end(p + n) {}
+    template<class T> T raw() {
+        if (ptr + sizeof(T) > end)
+            throw Slic3r::FileIOError("slice cache: unexpected end of binary data");
+        T v;
+        memcpy(&v, ptr, sizeof(T));
+        ptr += sizeof(T);
+        return v;
+    }
+    int32_t i32() { return raw<int32_t>(); }
+    int64_t i64() { return raw<int64_t>(); }
+    uint64_t u64() { return raw<uint64_t>(); }
+    uint32_t u32() { return raw<uint32_t>(); }
+    uint8_t u8() { return raw<uint8_t>(); }
+    double f64() { return raw<double>(); }
+    float f32() { return raw<float>(); }
+    bool boolean() { return u8() != 0; }
+    std::string str() {
+        uint32_t n = u32();
+        if (ptr + n > end)
+            throw Slic3r::FileIOError("slice cache: unexpected end of binary data");
+        std::string s(reinterpret_cast<const char*>(ptr), n);
+        ptr += n;
+        return s;
+    }
+};
+
+static void write_points(Writer& w, const Points& pts) {
+    w.u32((uint32_t)pts.size());
+    for (const Point& p : pts) { w.i64(p.x()); w.i64(p.y()); }
+}
+static void read_points(Reader& r, Points& pts) {
+    uint32_t n = r.u32();
+    pts.reserve(pts.size() + n);
+    for (uint32_t i = 0; i < n; ++i) {
+        coord_t x = (coord_t)r.i64(), y = (coord_t)r.i64();
+        pts.emplace_back(x, y);
     }
 }
 
-static void to_json(json& j, const BoundingBox& bb) {
-    j.push_back(bb.min.x());
-    j.push_back(bb.min.y());
-    j.push_back(bb.max.x());
-    j.push_back(bb.max.y());
+static void write_bbox(Writer& w, const BoundingBox& bb) {
+    w.i64(bb.min.x()); w.i64(bb.min.y()); w.i64(bb.max.x()); w.i64(bb.max.y());
+}
+static void read_bbox(Reader& r, BoundingBox& bb) {
+    coord_t x0 = (coord_t)r.i64(), y0 = (coord_t)r.i64(), x1 = (coord_t)r.i64(), y1 = (coord_t)r.i64();
+    bb.min = Point(x0, y0);
+    bb.max = Point(x1, y1);
+    bb.defined = true;
 }
 
-static void to_json(json& j, const ExPolygon& polygon) {
-    json contour_json = json::array(), holes_json = json::array();
-
-    //contour
-    const Polygon& slice_contour =   polygon.contour;
-    contour_json = slice_contour.points;
-    j[JSON_POLYGON_CONTOUR] = std::move(contour_json);
-
-    //holes
-    const Polygons& slice_holes =   polygon.holes;
-    for (const Polygon& hole_polyon : slice_holes)
-    {
-        json hole_json = json::array();
-        hole_json =  hole_polyon.points;
-        holes_json.push_back(std::move(hole_json));
+static void write_expolygon(Writer& w, const ExPolygon& poly) {
+    write_points(w, poly.contour.points);
+    w.u32((uint32_t)poly.holes.size());
+    for (const Polygon& hole : poly.holes) write_points(w, hole.points);
+}
+static void read_expolygon(Reader& r, ExPolygon& poly) {
+    read_points(r, poly.contour.points);
+    uint32_t holes_count = r.u32();
+    for (uint32_t i = 0; i < holes_count; ++i) {
+        Polygon hole;
+        read_points(r, hole.points);
+        poly.holes.push_back(std::move(hole));
     }
-    j[JSON_POLYGON_HOLES] = std::move(holes_json);
 }
 
-static void to_json(json& j, const Surface& surf) {
-    j[JSON_EXPOLYGON] = surf.expolygon;
-    j[JSON_SURF_TYPE] = surf.surface_type;
-    j[JSON_SURF_THICKNESS] = surf.thickness;
-    j[JSON_SURF_THICKNESS_LAYER] = surf.thickness_layers;
-    j[JSON_SURF_BRIDGE_ANGLE] = surf.bridge_angle;
-    j[JSON_SURF_EXTRA_PERIMETERS] = surf.extra_perimeters;
+static void write_surface(Writer& w, const Surface& surf) {
+    write_expolygon(w, surf.expolygon);
+    w.u8((uint8_t)surf.surface_type);
+    w.f64(surf.thickness);
+    w.u32(surf.thickness_layers);
+    w.f64(surf.bridge_angle);
+    w.u32(surf.extra_perimeters);
+}
+static void read_surface(Reader& r, Surface& surf) {
+    read_expolygon(r, surf.expolygon);
+    surf.surface_type = (SurfaceType)r.u8();
+    surf.thickness = r.f64();
+    surf.thickness_layers = (unsigned short)r.u32();
+    surf.bridge_angle = r.f64();
+    surf.extra_perimeters = (unsigned short)r.u32();
 }
 
-static void to_json(json& j, const ArcSegment& arc_seg) {
-    json start_point_json = json::array(), end_point_json = json::array(), center_point_json = json::array();
-    j[JSON_IS_ARC] = arc_seg.is_arc;
-    j[JSON_ARC_LENGTH] = arc_seg.length;
-    j[JSON_ARC_ANGLE_RADIUS] = arc_seg.angle_radians;
-    j[JSON_ARC_POLAY_START_THETA] = arc_seg.polar_start_theta;
-    j[JSON_ARC_POLAY_END_THETA] = arc_seg.polar_end_theta;
-    start_point_json.push_back(arc_seg.start_point.x());
-    start_point_json.push_back(arc_seg.start_point.y());
-    j[JSON_ARC_START_POINT] = std::move(start_point_json);
-    end_point_json.push_back(arc_seg.end_point.x());
-    end_point_json.push_back(arc_seg.end_point.y());
-    j[JSON_ARC_END_POINT] = std::move(end_point_json);
-    j[JSON_ARC_DIRECTION] = arc_seg.direction;
-    j[JSON_ARC_RADIUS] = arc_seg.radius;
-    center_point_json.push_back(arc_seg.center.x());
-    center_point_json.push_back(arc_seg.center.y());
-    j[JSON_ARC_CENTER] = std::move(center_point_json);
+static void write_arc_segment(Writer& w, const ArcSegment& arc) {
+    w.f64(arc.length);
+    w.f64(arc.angle_radians);
+    w.f64(arc.polar_start_theta);
+    w.f64(arc.polar_end_theta);
+    w.i64(arc.start_point.x()); w.i64(arc.start_point.y());
+    w.i64(arc.end_point.x()); w.i64(arc.end_point.y());
+    w.u8((uint8_t)arc.direction);
+    w.f64(arc.radius);
+    w.i64(arc.center.x()); w.i64(arc.center.y());
+}
+static void read_arc_segment(Reader& r, ArcSegment& arc) {
+    arc.is_arc = true;
+    arc.length = r.f64();
+    arc.angle_radians = r.f64();
+    arc.polar_start_theta = r.f64();
+    arc.polar_end_theta = r.f64();
+    arc.start_point = Point((coord_t)r.i64(), (coord_t)r.i64());
+    arc.end_point = Point((coord_t)r.i64(), (coord_t)r.i64());
+    arc.direction = (ArcDirection)r.u8();
+    arc.radius = r.f64();
+    arc.center = Point((coord_t)r.i64(), (coord_t)r.i64());
 }
 
-
-static void to_json(json& j, const Polyline& poly_line) {
-    json points_json = json::array(), fittings_json = json::array();
-    points_json = poly_line.points;
-
-    j[JSON_POINTS] = std::move(points_json);
-    for (const PathFittingData& path_fitting : poly_line.fitting_result)
-    {
-        json fitting_json;
-        fitting_json[JSON_ARC_START_INDEX] = path_fitting.start_point_index;
-        fitting_json[JSON_ARC_END_INDEX] = path_fitting.end_point_index;
-        fitting_json[JSON_ARC_PATH_TYPE] = path_fitting.path_type;
-        if (path_fitting.arc_data.is_arc)
-            fitting_json[JSON_ARC_DATA] = path_fitting.arc_data;
-
-        fittings_json.push_back(std::move(fitting_json));
+static void write_polyline(Writer& w, const Polyline& pl) {
+    write_points(w, pl.points);
+    w.u32((uint32_t)pl.fitting_result.size());
+    for (const PathFittingData& pf : pl.fitting_result) {
+        w.u64((uint64_t)pf.start_point_index);
+        w.u64((uint64_t)pf.end_point_index);
+        w.u8((uint8_t)pf.path_type);
+        w.boolean(pf.arc_data.is_arc);
+        if (pf.arc_data.is_arc) write_arc_segment(w, pf.arc_data);
     }
-    j[JSON_ARC_FITTING] = fittings_json;
 }
-
-static void to_json(json& j, const ExtrusionPath& extrusion_path) {
-    // ORCA: extrusion_path.polyline is a Polyline3 (has a Z coordinate per point), but only the
-    // custom to_json/from_json for the 2D Polyline type is implemented below. Serializing the
-    // Polyline3 directly falls back to nlohmann's generic container serialization (a plain
-    // [[x,y,z],...] array), which the matching from_json (expecting the Polyline object format)
-    // cannot parse (throws json::type_error 305). Project down to 2D first, matching what
-    // from_json(ExtrusionPath) already does on load (it reconstructs the Polyline3 with z=0).
-    j[JSON_EXTRUSION_POLYLINE] = extrusion_path.polyline.to_polyline();
-    j[JSON_EXTRUSION_MM3_PER_MM] = extrusion_path.mm3_per_mm;
-    j[JSON_EXTRUSION_WIDTH] = extrusion_path.width;
-    j[JSON_EXTRUSION_HEIGHT] = extrusion_path.height;
-    j[JSON_EXTRUSION_ROLE] = extrusion_path.role();
-    j[JSON_EXTRUSION_NO_EXTRUSION] = extrusion_path.is_force_no_extrusion();
-}
-
-static bool convert_extrusion_to_json(json& entity_json, json& entity_paths_json, const ExtrusionEntity* extrusion_entity) {
-    std::string path_type;
-    const ExtrusionPath* path = NULL;
-    const ExtrusionMultiPath* multipath = NULL;
-    const ExtrusionLoop* loop = NULL;
-    const ExtrusionEntityCollection* collection = dynamic_cast<const ExtrusionEntityCollection*>(extrusion_entity);
-
-    if (!collection)
-        path = dynamic_cast<const ExtrusionPath*>(extrusion_entity);
-
-    if (!collection && !path)
-        multipath = dynamic_cast<const ExtrusionMultiPath*>(extrusion_entity);
-
-    if (!collection && !path && !multipath)
-        loop = dynamic_cast<const ExtrusionLoop*>(extrusion_entity);
-
-    path_type = path?JSON_EXTRUSION_TYPE_PATH:(multipath?JSON_EXTRUSION_TYPE_MULTIPATH:(loop?JSON_EXTRUSION_TYPE_LOOP:JSON_EXTRUSION_TYPE_COLLECTION));
-    if (path_type.empty()) {
-        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(":invalid extrusion path type Found");
-        return false;
+static void read_polyline(Reader& r, Polyline& pl) {
+    read_points(r, pl.points);
+    uint32_t n = r.u32();
+    for (uint32_t i = 0; i < n; ++i) {
+        PathFittingData pf;
+        pf.start_point_index = (size_t)r.u64();
+        pf.end_point_index = (size_t)r.u64();
+        pf.path_type = (EMovePathType)r.u8();
+        if (r.boolean()) read_arc_segment(r, pf.arc_data);
+        pl.fitting_result.push_back(std::move(pf));
     }
+}
 
-    entity_json[JSON_EXTRUSION_ENTITY_TYPE] = path_type;
+static void write_extrusion_path(Writer& w, const ExtrusionPath& path) {
+    // ORCA: path.polyline is a Polyline3; project to 2D like the previous JSON codec did
+    // (Z is not needed here -- from_json/read side always reconstructs it as 0).
+    write_polyline(w, path.polyline.to_polyline());
+    w.f64(path.mm3_per_mm);
+    w.f32(path.width);
+    w.f32(path.height);
+    w.u8((uint8_t)path.role());
+    w.boolean(path.is_force_no_extrusion());
+}
+static void read_extrusion_path(Reader& r, ExtrusionPath& path) {
+    Polyline pl2d;
+    read_polyline(r, pl2d);
+    path.polyline = Polyline3(pl2d);
+    path.mm3_per_mm = r.f64();
+    path.width = r.f32();
+    path.height = r.f32();
+    path.set_extrusion_role((ExtrusionRole)r.u8());
+    path.set_force_no_extrusion(r.boolean());
+}
+
+enum EntityTag : uint8_t { EntPath = 0, EntMultiPath = 1, EntLoop = 2, EntCollection = 3 };
+
+static void write_extrusion_entity(Writer& w, const ExtrusionEntity* entity);
+static void write_entity_collection_fields(Writer& w, const ExtrusionEntityCollection& coll) {
+    w.boolean(coll.no_sort);
+    w.u32((uint32_t)coll.entities.size());
+    for (const ExtrusionEntity* e : coll.entities) write_extrusion_entity(w, e);
+}
+static void write_extrusion_entity(Writer& w, const ExtrusionEntity* entity) {
+    const auto* collection = dynamic_cast<const ExtrusionEntityCollection*>(entity);
+    const auto* path = collection ? nullptr : dynamic_cast<const ExtrusionPath*>(entity);
+    const auto* multipath = (collection || path) ? nullptr : dynamic_cast<const ExtrusionMultiPath*>(entity);
+    const auto* loop = (collection || path || multipath) ? nullptr : dynamic_cast<const ExtrusionLoop*>(entity);
 
     if (path) {
-        json entity_path_json = *path;
-        entity_paths_json.push_back(std::move(entity_path_json));
+        w.u8(EntPath);
+        write_extrusion_path(w, *path);
     }
     else if (multipath) {
-        for (const ExtrusionPath& extrusion_path : multipath->paths)
-        {
-            json entity_path_json = extrusion_path;
-            entity_paths_json.push_back(std::move(entity_path_json));
-        }
+        w.u8(EntMultiPath);
+        w.u32((uint32_t)multipath->paths.size());
+        for (const ExtrusionPath& p : multipath->paths) write_extrusion_path(w, p);
     }
     else if (loop) {
-        entity_json[JSON_EXTRUSION_LOOP_ROLE] = loop->loop_role();
-        for (const ExtrusionPath& extrusion_path : loop->paths)
-        {
-            json entity_path_json = extrusion_path;
-            entity_paths_json.push_back(std::move(entity_path_json));
-        }
+        w.u8(EntLoop);
+        w.u8((uint8_t)loop->loop_role());
+        w.u32((uint32_t)loop->paths.size());
+        for (const ExtrusionPath& p : loop->paths) write_extrusion_path(w, p);
     }
     else {
-        //recursive collections
-        entity_json[JSON_EXTRUSION_NO_SORT] = collection->no_sort;
-        for (const ExtrusionEntity* recursive_extrusion_entity : collection->entities) {
-            json recursive_entity_json, recursive_entity_paths_json = json::array();
-            bool ret = convert_extrusion_to_json(recursive_entity_json, recursive_entity_paths_json, recursive_extrusion_entity);
-            if (!ret) {
-                continue;
-            }
-            entity_paths_json.push_back(std::move(recursive_entity_json));
-        }
+        w.u8(EntCollection);
+        write_entity_collection_fields(w, *collection);
     }
-
-    if (collection)
-        entity_json[JSON_EXTRUSION_ENTITIES] = std::move(entity_paths_json);
-    else
-        entity_json[JSON_EXTRUSION_PATHS] = std::move(entity_paths_json);
-    return true;
 }
 
-static void to_json(json& j, const LayerRegion& layer_region) {
-    json unsupported_bridge_edges_json = json::array(), slices_surfaces_json = json::array(), raw_slices_json = json::array(), thin_fills_json, thin_fill_entities_json = json::array();
-    json fill_expolygons_json = json::array(), fill_no_overlap_expolygons_json = json::array(), fill_surfaces_json = json::array(), perimeters_json, perimeter_entities_json = json::array(), fills_json, fill_entities_json = json::array();
-
-    j[JSON_LAYER_REGION_CONFIG_HASH] = layer_region.region().config_hash();
-    //slices
-    for (const Surface& slice_surface : layer_region.slices.surfaces) {
-        json surface_json = slice_surface;
-        slices_surfaces_json.push_back(std::move(surface_json));
-    }
-    j.push_back({JSON_LAYER_REGION_SLICES, std::move(slices_surfaces_json)});
-
-    //raw_slices
-    for (const ExPolygon& raw_slice_explogyon : layer_region.raw_slices) {
-        json raw_polygon_json = raw_slice_explogyon;
-
-        raw_slices_json.push_back(std::move(raw_polygon_json));
-    }
-    j.push_back({JSON_LAYER_REGION_RAW_SLICES, std::move(raw_slices_json)});
-
-    //thin fills
-    thin_fills_json[JSON_EXTRUSION_NO_SORT] = layer_region.thin_fills.no_sort;
-    thin_fills_json[JSON_EXTRUSION_ENTITY_TYPE] = JSON_EXTRUSION_TYPE_COLLECTION;
-    for (const ExtrusionEntity* extrusion_entity : layer_region.thin_fills.entities) {
-        json thinfills_entity_json, thinfill_entity_paths_json = json::array();
-        bool ret = convert_extrusion_to_json(thinfills_entity_json, thinfill_entity_paths_json, extrusion_entity);
-        if (!ret) {
-            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(":error found at print_z %1%") % layer_region.layer()->print_z;
-            continue;
-        }
-
-        thin_fill_entities_json.push_back(std::move(thinfills_entity_json));
-    }
-    thin_fills_json[JSON_EXTRUSION_ENTITIES] = std::move(thin_fill_entities_json);
-    j.push_back({JSON_LAYER_REGION_THIN_FILLS, std::move(thin_fills_json)});
-
-    //fill_expolygons
-    for (const ExPolygon& fill_expolygon : layer_region.fill_expolygons) {
-        json fill_expolygon_json = fill_expolygon;
-
-        fill_expolygons_json.push_back(std::move(fill_expolygon_json));
-    }
-    j.push_back({JSON_LAYER_REGION_FILL_EXPOLYGONS, std::move(fill_expolygons_json)});
-
-    //fill_surfaces
-    for (const Surface& fill_surface : layer_region.fill_surfaces.surfaces) {
-        json surface_json = fill_surface;
-        fill_surfaces_json.push_back(std::move(surface_json));
-    }
-    j.push_back({JSON_LAYER_REGION_FILL_SURFACES, std::move(fill_surfaces_json)});
-
-    //fill_no_overlap_expolygons
-    for (const ExPolygon& fill_no_overlap_expolygon : layer_region.fill_no_overlap_expolygons) {
-        json fill_no_overlap_expolygon_json = fill_no_overlap_expolygon;
-
-        fill_no_overlap_expolygons_json.push_back(std::move(fill_no_overlap_expolygon_json));
-    }
-    j.push_back({JSON_LAYER_REGION_FILL_NO_OVERLAP, std::move(fill_no_overlap_expolygons_json)});
-
-    //unsupported_bridge_edges
-    for (const Polyline& poly_line : layer_region.unsupported_bridge_edges)
-    {
-        json polyline_json = poly_line;
-
-        unsupported_bridge_edges_json.push_back(std::move(polyline_json));
-    }
-    j.push_back({JSON_LAYER_REGION_UNSUPPORTED_BRIDGE_EDGES, std::move(unsupported_bridge_edges_json)});
-
-    //perimeters
-    perimeters_json[JSON_EXTRUSION_NO_SORT] = layer_region.perimeters.no_sort;
-    perimeters_json[JSON_EXTRUSION_ENTITY_TYPE] = JSON_EXTRUSION_TYPE_COLLECTION;
-    for (const ExtrusionEntity* extrusion_entity : layer_region.perimeters.entities) {
-        json perimeters_entity_json, perimeters_entity_paths_json = json::array();
-        bool ret = convert_extrusion_to_json(perimeters_entity_json, perimeters_entity_paths_json, extrusion_entity);
-        if (!ret)
-            continue;
-
-        perimeter_entities_json.push_back(std::move(perimeters_entity_json));
-    }
-    perimeters_json[JSON_EXTRUSION_ENTITIES] = std::move(perimeter_entities_json);
-    j.push_back({JSON_LAYER_REGION_PERIMETERS, std::move(perimeters_json)});
-
-    //fills
-    fills_json[JSON_EXTRUSION_NO_SORT] = layer_region.fills.no_sort;
-    fills_json[JSON_EXTRUSION_ENTITY_TYPE] = JSON_EXTRUSION_TYPE_COLLECTION;
-    for (const ExtrusionEntity* extrusion_entity : layer_region.fills.entities) {
-        json fill_entity_json, fill_entity_paths_json = json::array();
-        bool ret = convert_extrusion_to_json(fill_entity_json, fill_entity_paths_json, extrusion_entity);
-        if (!ret)
-            continue;
-
-        fill_entities_json.push_back(std::move(fill_entity_json));
-    }
-    fills_json[JSON_EXTRUSION_ENTITIES] = std::move(fill_entities_json);
-    j.push_back({JSON_LAYER_REGION_FILLS, std::move(fills_json)});
-
-    return;
-}
-
-static void to_json(json& j, const groupedVolumeSlices& first_layer_group) {
-    json volumes_json = json::array(), slices_json = json::array();
-    j[JSON_FIRSTLAYER_GROUP_ID] = first_layer_group.groupId;
-
-    for (const ObjectID& obj_id : first_layer_group.volume_ids)
-    {
-        volumes_json.push_back(obj_id.id);
-    }
-    j[JSON_FIRSTLAYER_GROUP_VOLUME_IDS] = std::move(volumes_json);
-
-    for (const ExPolygon& slice_expolygon : first_layer_group.slices) {
-        json slice_expolygon_json = slice_expolygon;
-
-        slices_json.push_back(std::move(slice_expolygon_json));
-    }
-    j[JSON_FIRSTLAYER_GROUP_SLICES] = std::move(slices_json);
-}
-
-//load apis from json
-static void from_json(const json& j, Points& p_s) {
-    int array_size = j.size();
-    for (int index = 0; index < array_size/2; index++)
-    {
-        coord_t x = j[2*index], y = j[2*index+1];
-        Point p(x, y);
-        p_s.push_back(std::move(p));
-    }
-    return;
-}
-
-static void from_json(const json& j, BoundingBox& bbox) {
-    bbox.min[0] = j[0];
-    bbox.min[1] = j[1];
-    bbox.max[0] = j[2];
-    bbox.max[1] = j[3];
-    bbox.defined = true;
-
-    return;
-}
-
-static void from_json(const json& j, ExPolygon& polygon) {
-    polygon.contour.points = j[JSON_POLYGON_CONTOUR];
-
-    int holes_count = j[JSON_POLYGON_HOLES].size();
-    for (int holes_index = 0; holes_index < holes_count; holes_index++)
-    {
-        Polygon poly;
-
-        poly.points = j[JSON_POLYGON_HOLES][holes_index];
-        polygon.holes.push_back(std::move(poly));
-    }
-    return;
-}
-
-static void from_json(const json& j, Surface& surf) {
-    surf.expolygon = j[JSON_EXPOLYGON];
-    surf.surface_type = j[JSON_SURF_TYPE];
-    surf.thickness = j[JSON_SURF_THICKNESS];
-    surf.thickness_layers = j[JSON_SURF_THICKNESS_LAYER];
-    surf.bridge_angle = j[JSON_SURF_BRIDGE_ANGLE];
-    surf.extra_perimeters = j[JSON_SURF_EXTRA_PERIMETERS];
-
-    return;
-}
-
-static void from_json(const json& j, ArcSegment& arc_seg) {
-    arc_seg.is_arc = j[JSON_IS_ARC];
-    arc_seg.length = j[JSON_ARC_LENGTH];
-    arc_seg.angle_radians = j[JSON_ARC_ANGLE_RADIUS];
-    arc_seg.polar_start_theta = j[JSON_ARC_POLAY_START_THETA];
-    arc_seg.polar_end_theta = j[JSON_ARC_POLAY_END_THETA];
-    arc_seg.start_point.x() = j[JSON_ARC_START_POINT][0];
-    arc_seg.start_point.y() = j[JSON_ARC_START_POINT][1];
-    arc_seg.end_point.x() = j[JSON_ARC_END_POINT][0];
-    arc_seg.end_point.y() = j[JSON_ARC_END_POINT][1];
-    arc_seg.direction = j[JSON_ARC_DIRECTION];
-    arc_seg.radius    = j[JSON_ARC_RADIUS];
-    arc_seg.center.x() = j[JSON_ARC_CENTER][0];
-    arc_seg.center.y() = j[JSON_ARC_CENTER][1];
-
-    return;
-}
-
-
-static void from_json(const json& j, Polyline& poly_line) {
-    poly_line.points = j[JSON_POINTS];
-
-    int arc_fitting_count = j[JSON_ARC_FITTING].size();
-    for (int arc_fitting_index = 0; arc_fitting_index < arc_fitting_count; arc_fitting_index++)
-    {
-        const json& fitting_json = j[JSON_ARC_FITTING][arc_fitting_index];
-        PathFittingData path_fitting;
-        path_fitting.start_point_index = fitting_json[JSON_ARC_START_INDEX];
-        path_fitting.end_point_index = fitting_json[JSON_ARC_END_INDEX];
-        path_fitting.path_type = fitting_json[JSON_ARC_PATH_TYPE];
-
-        if (fitting_json.contains(JSON_ARC_DATA)) {
-            path_fitting.arc_data = fitting_json[JSON_ARC_DATA];
-        }
-
-        poly_line.fitting_result.push_back(std::move(path_fitting));
-    }
-    return;
-}
-
-static void from_json(const json& j, ExtrusionPath& extrusion_path) {
-    Polyline temp_polyline = j[JSON_EXTRUSION_POLYLINE];
-    extrusion_path.polyline = Polyline3(temp_polyline);
-    extrusion_path.mm3_per_mm             =    j[JSON_EXTRUSION_MM3_PER_MM];
-    extrusion_path.width                  =    j[JSON_EXTRUSION_WIDTH];
-    extrusion_path.height                 =    j[JSON_EXTRUSION_HEIGHT];
-    extrusion_path.set_extrusion_role(j[JSON_EXTRUSION_ROLE]);
-    extrusion_path.set_force_no_extrusion(j[JSON_EXTRUSION_NO_EXTRUSION]);
-}
-
-static bool convert_extrusion_from_json(const json& entity_json, ExtrusionEntityCollection& entity_collection) {
-    std::string path_type = entity_json[JSON_EXTRUSION_ENTITY_TYPE];
-    bool ret = false;
-
-    if (path_type == JSON_EXTRUSION_TYPE_PATH) {
+static void read_extrusion_entity(Reader& r, ExtrusionEntityCollection& parent) {
+    uint8_t tag = r.u8();
+    switch (tag) {
+    case EntPath: {
         ExtrusionPath* path = new ExtrusionPath();
-        if (!path) {
-            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(": oom when new ExtrusionPath");
-            return false;
-        }
-        *path = entity_json[JSON_EXTRUSION_PATHS][0];
-        entity_collection.entities.push_back(path);
+        read_extrusion_path(r, *path);
+        parent.entities.push_back(path);
+        break;
     }
-    else if (path_type == JSON_EXTRUSION_TYPE_MULTIPATH) {
-        ExtrusionMultiPath* multipath = new ExtrusionMultiPath();
-        if (!multipath) {
-            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(": oom when new ExtrusionMultiPath");
-            return false;
-        }
-        int paths_count = entity_json[JSON_EXTRUSION_PATHS].size();
-        for (int path_index = 0; path_index < paths_count; path_index++)
-        {
-            ExtrusionPath path;
-            path = entity_json[JSON_EXTRUSION_PATHS][path_index];
-            multipath->paths.push_back(std::move(path));
-        }
-        entity_collection.entities.push_back(multipath);
+    case EntMultiPath: {
+        ExtrusionMultiPath* mp = new ExtrusionMultiPath();
+        uint32_t n = r.u32();
+        for (uint32_t i = 0; i < n; ++i) { ExtrusionPath p; read_extrusion_path(r, p); mp->paths.push_back(std::move(p)); }
+        parent.entities.push_back(mp);
+        break;
     }
-    else if (path_type == JSON_EXTRUSION_TYPE_LOOP) {
+    case EntLoop: {
         ExtrusionLoop* loop = new ExtrusionLoop();
-        if (!loop) {
-            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(": oom when new ExtrusionLoop");
-            return false;
-        }
-        loop->set_loop_role(entity_json[JSON_EXTRUSION_LOOP_ROLE]);
-        int paths_count = entity_json[JSON_EXTRUSION_PATHS].size();
-        for (int path_index = 0; path_index < paths_count; path_index++)
-        {
-            ExtrusionPath path;
-            path = entity_json[JSON_EXTRUSION_PATHS][path_index];
-            loop->paths.push_back(std::move(path));
-        }
-        entity_collection.entities.push_back(loop);
+        loop->set_loop_role((ExtrusionLoopRole)r.u8());
+        uint32_t n = r.u32();
+        for (uint32_t i = 0; i < n; ++i) { ExtrusionPath p; read_extrusion_path(r, p); loop->paths.push_back(std::move(p)); }
+        parent.entities.push_back(loop);
+        break;
     }
-    else if (path_type == JSON_EXTRUSION_TYPE_COLLECTION) {
-        ExtrusionEntityCollection* collection = new ExtrusionEntityCollection();
-        if (!collection) {
-            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(": oom when new ExtrusionEntityCollection");
-            return false;
-        }
-        collection->no_sort = entity_json[JSON_EXTRUSION_NO_SORT];
-        int entities_count = entity_json[JSON_EXTRUSION_ENTITIES].size();
-        for (int entity_index = 0; entity_index < entities_count; entity_index++)
-        {
-            const json& entity_item_json = entity_json[JSON_EXTRUSION_ENTITIES][entity_index];
-            ret = convert_extrusion_from_json(entity_item_json, *collection);
-            if (!ret) {
-                BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(": convert_extrusion_from_json failed");
-                return false;
-            }
-        }
-        entity_collection.entities.push_back(collection);
+    case EntCollection: {
+        ExtrusionEntityCollection* coll = new ExtrusionEntityCollection();
+        coll->no_sort = r.boolean();
+        uint32_t n = r.u32();
+        for (uint32_t i = 0; i < n; ++i) read_extrusion_entity(r, *coll);
+        parent.entities.push_back(coll);
+        break;
     }
-    else {
-        BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(": unknown path type %1%")%path_type;
-        return false;
-    }
-
-    return true;
-}
-
-static void convert_layer_region_from_json(const json& j, LayerRegion& layer_region) {
-    //slices
-    int slices_count = j[JSON_LAYER_REGION_SLICES].size();
-    for (int slices_index = 0; slices_index < slices_count; slices_index++)
-    {
-        Surface surface;
-
-        surface = j[JSON_LAYER_REGION_SLICES][slices_index];
-        layer_region.slices.surfaces.push_back(std::move(surface));
-    }
-
-    //raw_slices
-    int raw_slices_count = j[JSON_LAYER_REGION_RAW_SLICES].size();
-    for (int raw_slices_index = 0; raw_slices_index < raw_slices_count; raw_slices_index++)
-    {
-        ExPolygon polygon;
-
-        polygon = j[JSON_LAYER_REGION_RAW_SLICES][raw_slices_index];
-        layer_region.raw_slices.push_back(std::move(polygon));
-    }
-
-    //thin fills
-    layer_region.thin_fills.no_sort = j[JSON_LAYER_REGION_THIN_FILLS][JSON_EXTRUSION_NO_SORT];
-    int thinfills_entities_count = j[JSON_LAYER_REGION_THIN_FILLS][JSON_EXTRUSION_ENTITIES].size();
-    for (int thinfills_entities_index = 0; thinfills_entities_index < thinfills_entities_count; thinfills_entities_index++)
-    {
-        const json& extrusion_entity_json =  j[JSON_LAYER_REGION_THIN_FILLS][JSON_EXTRUSION_ENTITIES][thinfills_entities_index];
-        bool ret = convert_extrusion_from_json(extrusion_entity_json, layer_region.thin_fills);
-        if (!ret) {
-            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(":error parsing thin_fills found at layer %1%, print_z %2%") %layer_region.layer()->id() %layer_region.layer()->print_z;
-            char error_buf[1024];
-            ::sprintf(error_buf, "Error while parsing thin_fills at layer %zu, print_z %f", layer_region.layer()->id(), layer_region.layer()->print_z);
-            throw Slic3r::FileIOError(error_buf);
-        }
-    }
-
-    //fill_expolygons
-    int fill_expolygons_count = j[JSON_LAYER_REGION_FILL_EXPOLYGONS].size();
-    for (int fill_expolygons_index = 0; fill_expolygons_index < fill_expolygons_count; fill_expolygons_index++)
-    {
-        ExPolygon polygon;
-
-        polygon = j[JSON_LAYER_REGION_FILL_EXPOLYGONS][fill_expolygons_index];
-        layer_region.fill_expolygons.push_back(std::move(polygon));
-    }
-
-    //fill_surfaces
-    int fill_surfaces_count = j[JSON_LAYER_REGION_FILL_SURFACES].size();
-    for (int fill_surfaces_index = 0; fill_surfaces_index < fill_surfaces_count; fill_surfaces_index++)
-    {
-        Surface surface;
-
-        surface = j[JSON_LAYER_REGION_FILL_SURFACES][fill_surfaces_index];
-        layer_region.fill_surfaces.surfaces.push_back(std::move(surface));
-    }
-
-    //fill_no_overlap_expolygons
-    int fill_no_overlap_expolygons_count = j[JSON_LAYER_REGION_FILL_NO_OVERLAP].size();
-    for (int fill_no_overlap_expolygons_index = 0; fill_no_overlap_expolygons_index < fill_no_overlap_expolygons_count; fill_no_overlap_expolygons_index++)
-    {
-        ExPolygon polygon;
-
-        polygon = j[JSON_LAYER_REGION_FILL_NO_OVERLAP][fill_no_overlap_expolygons_index];
-        layer_region.fill_no_overlap_expolygons.push_back(std::move(polygon));
-    }
-
-    //unsupported_bridge_edges
-    int unsupported_bridge_edges_count = j[JSON_LAYER_REGION_UNSUPPORTED_BRIDGE_EDGES].size();
-    for (int unsupported_bridge_edges_index = 0; unsupported_bridge_edges_index < unsupported_bridge_edges_count; unsupported_bridge_edges_index++)
-    {
-        Polyline polyline;
-
-        polyline = j[JSON_LAYER_REGION_UNSUPPORTED_BRIDGE_EDGES][unsupported_bridge_edges_index];
-        layer_region.unsupported_bridge_edges.push_back(std::move(polyline));
-    }
-
-    //perimeters
-    layer_region.perimeters.no_sort = j[JSON_LAYER_REGION_PERIMETERS][JSON_EXTRUSION_NO_SORT];
-    int perimeters_entities_count = j[JSON_LAYER_REGION_PERIMETERS][JSON_EXTRUSION_ENTITIES].size();
-    for (int perimeters_entities_index = 0; perimeters_entities_index < perimeters_entities_count; perimeters_entities_index++)
-    {
-        const json& extrusion_entity_json =  j[JSON_LAYER_REGION_PERIMETERS][JSON_EXTRUSION_ENTITIES][perimeters_entities_index];
-        bool ret = convert_extrusion_from_json(extrusion_entity_json, layer_region.perimeters);
-        if (!ret) {
-            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(": error parsing perimeters found at layer %1%, print_z %2%") %layer_region.layer()->id() %layer_region.layer()->print_z;
-            char error_buf[1024];
-            ::sprintf(error_buf, "Error while parsing perimeters at layer %zu, print_z %f", layer_region.layer()->id(), layer_region.layer()->print_z);
-            throw Slic3r::FileIOError(error_buf);
-        }
-    }
-
-    //fills
-    layer_region.fills.no_sort = j[JSON_LAYER_REGION_FILLS][JSON_EXTRUSION_NO_SORT];
-    int fills_entities_count = j[JSON_LAYER_REGION_FILLS][JSON_EXTRUSION_ENTITIES].size();
-    for (int fills_entities_index = 0; fills_entities_index < fills_entities_count; fills_entities_index++)
-    {
-        const json& extrusion_entity_json =  j[JSON_LAYER_REGION_FILLS][JSON_EXTRUSION_ENTITIES][fills_entities_index];
-        bool ret = convert_extrusion_from_json(extrusion_entity_json, layer_region.fills);
-        if (!ret) {
-            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(": error parsing fills found at layer %1%, print_z %2%") %layer_region.layer()->id() %layer_region.layer()->print_z;
-            char error_buf[1024];
-            ::sprintf(error_buf, "Error while parsing fills at layer %zu, print_z %f", layer_region.layer()->id(), layer_region.layer()->print_z);
-            throw Slic3r::FileIOError(error_buf);
-        }
-    }
-
-    return;
-}
-
-
-void extract_layer(const json& layer_json, Layer& layer) {
-    //slice_polygons
-    int slice_polygons_count = layer_json[JSON_LAYER_SLICED_POLYGONS].size();
-    for (int polygon_index = 0; polygon_index < slice_polygons_count; polygon_index++)
-    {
-        ExPolygon polygon;
-
-        polygon = layer_json[JSON_LAYER_SLICED_POLYGONS][polygon_index];
-        layer.lslices.push_back(std::move(polygon));
-    }
-
-    //slice_bboxes
-    int sliced_bboxes_count = layer_json[JSON_LAYER_SLLICED_BBOXES].size();
-    for (int bbox_index = 0; bbox_index < sliced_bboxes_count; bbox_index++)
-    {
-        BoundingBox bbox;
-
-        bbox = layer_json[JSON_LAYER_SLLICED_BBOXES][bbox_index];
-        layer.lslices_bboxes.push_back(std::move(bbox));
-    }
-
-    //overhang_polygons
-    int overhang_polygons_count = layer_json[JSON_LAYER_OVERHANG_POLYGONS].size();
-    for (int polygon_index = 0; polygon_index < overhang_polygons_count; polygon_index++)
-    {
-        ExPolygon polygon;
-
-        polygon = layer_json[JSON_LAYER_OVERHANG_POLYGONS][polygon_index];
-        layer.loverhangs.push_back(std::move(polygon));
-    }
-
-    //overhang_box
-    layer.loverhangs_bbox = layer_json[JSON_LAYER_OVERHANG_BBOX];
-
-    //layer_regions
-    int layer_region_count = layer.region_count();
-    for (int layer_region_index = 0; layer_region_index < layer_region_count; layer_region_index++)
-    {
-        LayerRegion* layer_region = layer.get_region(layer_region_index);
-        const json& layer_region_json = layer_json[JSON_LAYER_REGIONS][layer_region_index];
-        convert_layer_region_from_json(layer_region_json, *layer_region);
-
-        //LayerRegion layer_region = layer_json[JSON_LAYER_REGIONS][layer_region_index];
-    }
-
-    return;
-}
-
-void extract_support_layer(const json& support_layer_json, SupportLayer& support_layer) {
-    extract_layer(support_layer_json, support_layer);
-
-    support_layer.support_type = support_layer_json[JSON_SUPPORT_LAYER_TYPE];
-    //support_islands
-    int islands_count = support_layer_json[JSON_SUPPORT_LAYER_ISLANDS].size();
-    for (int islands_index = 0; islands_index < islands_count; islands_index++)
-    {
-        ExPolygon polygon;
-
-        polygon = support_layer_json[JSON_SUPPORT_LAYER_ISLANDS][islands_index];
-        support_layer.support_islands.push_back(std::move(polygon));
-    }
-
-    //support_fills
-    support_layer.support_fills.no_sort = support_layer_json[JSON_SUPPORT_LAYER_FILLS][JSON_EXTRUSION_NO_SORT];
-    int support_fills_entities_count = support_layer_json[JSON_SUPPORT_LAYER_FILLS][JSON_EXTRUSION_ENTITIES].size();
-    for (int support_fills_entities_index = 0; support_fills_entities_index < support_fills_entities_count; support_fills_entities_index++)
-    {
-        const json& extrusion_entity_json =  support_layer_json[JSON_SUPPORT_LAYER_FILLS][JSON_EXTRUSION_ENTITIES][support_fills_entities_index];
-        bool ret = convert_extrusion_from_json(extrusion_entity_json, support_layer.support_fills);
-        if (!ret) {
-            BOOST_LOG_TRIVIAL(error) << __FUNCTION__ << boost::format(": error parsing fills found at support_layer %1%, print_z %2%")%support_layer.id() %support_layer.print_z;
-            char error_buf[1024];
-            ::sprintf(error_buf, "Error while parsing fills at support_layer %zu, print_z %f", support_layer.id(), support_layer.print_z);
-            throw Slic3r::FileIOError(error_buf);
-        }
-    }
-
-    return;
-}
-
-static void from_json(const json& j, groupedVolumeSlices& firstlayer_group)
-{
-    firstlayer_group.groupId               =   j[JSON_FIRSTLAYER_GROUP_ID];
-
-    int volume_count = j[JSON_FIRSTLAYER_GROUP_VOLUME_IDS].size();
-    for (int volume_index = 0; volume_index < volume_count; volume_index++)
-    {
-        ObjectID obj_id;
-
-        obj_id.id = j[JSON_FIRSTLAYER_GROUP_VOLUME_IDS][volume_index];
-        firstlayer_group.volume_ids.push_back(std::move(obj_id));
-    }
-
-    int slices_count = j[JSON_FIRSTLAYER_GROUP_SLICES].size();
-    for (int slice_index = 0; slice_index < slices_count; slice_index++)
-    {
-        ExPolygon polygon;
-
-        polygon = j[JSON_FIRSTLAYER_GROUP_SLICES][slice_index];
-        firstlayer_group.slices.push_back(std::move(polygon));
+    default:
+        throw Slic3r::FileIOError("slice cache: unknown extrusion entity tag");
     }
 }
+static void read_entity_collection_fields(Reader& r, ExtrusionEntityCollection& coll) {
+    coll.no_sort = r.boolean();
+    uint32_t n = r.u32();
+    for (uint32_t i = 0; i < n; ++i) read_extrusion_entity(r, coll);
+}
+
+static void write_layer_region(Writer& w, const LayerRegion& lr) {
+    w.u64((uint64_t)lr.region().config_hash());
+    w.u32((uint32_t)lr.slices.surfaces.size());
+    for (const Surface& s : lr.slices.surfaces) write_surface(w, s);
+    w.u32((uint32_t)lr.raw_slices.size());
+    for (const ExPolygon& p : lr.raw_slices) write_expolygon(w, p);
+    write_entity_collection_fields(w, lr.thin_fills);
+    w.u32((uint32_t)lr.fill_expolygons.size());
+    for (const ExPolygon& p : lr.fill_expolygons) write_expolygon(w, p);
+    w.u32((uint32_t)lr.fill_surfaces.surfaces.size());
+    for (const Surface& s : lr.fill_surfaces.surfaces) write_surface(w, s);
+    w.u32((uint32_t)lr.fill_no_overlap_expolygons.size());
+    for (const ExPolygon& p : lr.fill_no_overlap_expolygons) write_expolygon(w, p);
+    w.u32((uint32_t)lr.unsupported_bridge_edges.size());
+    for (const Polyline& pl : lr.unsupported_bridge_edges) write_polyline(w, pl);
+    write_entity_collection_fields(w, lr.perimeters);
+    write_entity_collection_fields(w, lr.fills);
+}
+// NOTE: config_hash is written first by write_layer_region() above, but it is consumed by the
+// caller (to resolve the PrintRegion* and call add_region()) before this body is read.
+static void read_layer_region_body(Reader& r, LayerRegion& lr) {
+    uint32_t n;
+    n = r.u32(); for (uint32_t i = 0; i < n; ++i) { Surface s; read_surface(r, s); lr.slices.surfaces.push_back(std::move(s)); }
+    n = r.u32(); for (uint32_t i = 0; i < n; ++i) { ExPolygon p; read_expolygon(r, p); lr.raw_slices.push_back(std::move(p)); }
+    read_entity_collection_fields(r, lr.thin_fills);
+    n = r.u32(); for (uint32_t i = 0; i < n; ++i) { ExPolygon p; read_expolygon(r, p); lr.fill_expolygons.push_back(std::move(p)); }
+    n = r.u32(); for (uint32_t i = 0; i < n; ++i) { Surface s; read_surface(r, s); lr.fill_surfaces.surfaces.push_back(std::move(s)); }
+    n = r.u32(); for (uint32_t i = 0; i < n; ++i) { ExPolygon p; read_expolygon(r, p); lr.fill_no_overlap_expolygons.push_back(std::move(p)); }
+    n = r.u32(); for (uint32_t i = 0; i < n; ++i) { Polyline pl; read_polyline(r, pl); lr.unsupported_bridge_edges.push_back(std::move(pl)); }
+    read_entity_collection_fields(r, lr.perimeters);
+    read_entity_collection_fields(r, lr.fills);
+}
+
+static void write_grouped_volume_slices(Writer& w, const groupedVolumeSlices& g) {
+    w.i32(g.groupId);
+    w.u32((uint32_t)g.volume_ids.size());
+    for (const ObjectID& id : g.volume_ids) w.u64((uint64_t)id.id);
+    w.u32((uint32_t)g.slices.size());
+    for (const ExPolygon& p : g.slices) write_expolygon(w, p);
+}
+static void read_grouped_volume_slices(Reader& r, groupedVolumeSlices& g) {
+    g.groupId = r.i32();
+    uint32_t n = r.u32();
+    for (uint32_t i = 0; i < n; ++i) { ObjectID id; id.id = (size_t)r.u64(); g.volume_ids.push_back(id); }
+    n = r.u32();
+    for (uint32_t i = 0; i < n; ++i) { ExPolygon p; read_expolygon(r, p); g.slices.push_back(std::move(p)); }
+}
+
+// Stateless on purpose (no captures) so it can be called directly without std::function overhead.
+static const PrintRegion* find_region_by_hash(PrintObject* object, uint64_t config_hash) {
+    int regions_count = object->num_printing_regions();
+    for (int index = 0; index < regions_count; index++) {
+        const PrintRegion& print_region = object->printing_region(index);
+        if ((uint64_t)print_region.config_hash() == config_hash)
+            return &print_region;
+    }
+    return NULL;
+}
+
+// Shared by normal layers and support layers: lslices/bboxes/overhangs/overhang_bbox + regions.
+// Called after the layer object itself already exists (add_layer()/add_support_layer() need the
+// header fields print_z/height/slice_z/id[/interface_id] up front, so those are read by the caller).
+static void read_layer_geometry_and_regions(Reader& r, PrintObject* obj, Layer* layer, const std::string& obj_name) {
+    uint32_t n;
+    n = r.u32(); for (uint32_t i = 0; i < n; ++i) { ExPolygon p; read_expolygon(r, p); layer->lslices.push_back(std::move(p)); }
+    n = r.u32(); for (uint32_t i = 0; i < n; ++i) { BoundingBox b; read_bbox(r, b); layer->lslices_bboxes.push_back(std::move(b)); }
+    n = r.u32(); for (uint32_t i = 0; i < n; ++i) { ExPolygon p; read_expolygon(r, p); layer->loverhangs.push_back(std::move(p)); }
+    read_bbox(r, layer->loverhangs_bbox);
+    uint32_t region_count = r.u32();
+    for (uint32_t ri = 0; ri < region_count; ++ri) {
+        uint64_t config_hash = r.u64();
+        const PrintRegion* pr = find_region_by_hash(obj, config_hash);
+        if (!pr)
+            throw Slic3r::FileIOError("slice cache: region config_hash not found for object " + obj_name);
+        LayerRegion* nr = layer->add_region(pr);
+        read_layer_region_body(r, *nr);
+    }
+}
+static void write_layer_geometry_and_regions(Writer& w, const Layer& layer) {
+    w.u32((uint32_t)layer.lslices.size());
+    for (const ExPolygon& p : layer.lslices) write_expolygon(w, p);
+    w.u32((uint32_t)layer.lslices_bboxes.size());
+    for (const BoundingBox& b : layer.lslices_bboxes) write_bbox(w, b);
+    w.u32((uint32_t)layer.loverhangs.size());
+    for (const ExPolygon& p : layer.loverhangs) write_expolygon(w, p);
+    write_bbox(w, layer.loverhangs_bbox);
+    w.u32((uint32_t)layer.regions().size());
+    for (const LayerRegion* lr : layer.regions()) write_layer_region(w, *lr);
+}
+
+} // namespace SliceCacheBin
 
 int Print::export_cached_data(const std::string& directory, bool with_space)
 {
+    (void)with_space; // ORCA: binary format has no text pretty-printing concept
+    using namespace SliceCacheBin;
     int ret = 0;
     boost::filesystem::path directory_path(directory);
 
-    auto convert_layer_to_json = [](json& layer_json, const Layer* layer) {
-        json slice_polygons_json = json::array(), slice_bboxs_json = json::array(), overhang_polygons_json = json::array(), layer_regions_json = json::array();
-        layer_json[JSON_LAYER_PRINT_Z] = layer->print_z;
-        layer_json[JSON_LAYER_HEIGHT] = layer->height;
-        layer_json[JSON_LAYER_SLICE_Z] = layer->slice_z;
-        layer_json[JSON_LAYER_ID] = layer->id();
-        //layer_json["slicing_errors"] = layer->slicing_errors;
-
-        //sliced_polygons
-        for (const ExPolygon& slice_polygon : layer->lslices) {
-            json slice_polygon_json = slice_polygon;
-            slice_polygons_json.push_back(std::move(slice_polygon_json));
-        }
-        layer_json[JSON_LAYER_SLICED_POLYGONS] = std::move(slice_polygons_json);
-
-        //sliced_bbox
-        for (const BoundingBox& slice_bbox : layer->lslices_bboxes) {
-            json bbox_json = json::array();
-
-            bbox_json = slice_bbox;
-            slice_bboxs_json.push_back(std::move(bbox_json));
-        }
-        layer_json[JSON_LAYER_SLLICED_BBOXES] = std::move(slice_bboxs_json);
-
-        //overhang_polygons
-        for (const ExPolygon& overhang_polygon : layer->loverhangs) {
-            json overhang_polygon_json = overhang_polygon;
-            overhang_polygons_json.push_back(std::move(overhang_polygon_json));
-        }
-        layer_json[JSON_LAYER_OVERHANG_POLYGONS] = std::move(overhang_polygons_json);
-
-        //overhang_box
-        layer_json[JSON_LAYER_OVERHANG_BBOX] = layer->loverhangs_bbox;
-
-        for (const LayerRegion *layer_region : layer->regions()) {
-            json region_json = *layer_region;
-
-            layer_regions_json.push_back(std::move(region_json));
-        }
-        layer_json[JSON_LAYER_REGIONS] = std::move(layer_regions_json);
-
-        return;
-    };
-
-    //firstly clear this directory
     if (fs::exists(directory_path)) {
         fs::remove_all(directory_path);
     }
@@ -5497,9 +5149,8 @@ int Print::export_cached_data(const std::string& directory, bool with_space)
         return CLI_EXPORT_CACHE_DIRECTORY_CREATE_FAILED;
     }
 
-    int count = 0;
-    std::vector<std::string> filename_vector;
-    std::vector<json> json_vector;
+    struct Entry { std::string filename; PrintObject* obj; std::string name; size_t identify_id; };
+    std::vector<Entry> entries;
     for (PrintObject *obj : m_objects) {
         const ModelObject* model_obj = obj->model_object();
         if (obj->get_shared_object()) {
@@ -5510,184 +5161,77 @@ int Print::export_cached_data(const std::string& directory, bool with_space)
         const PrintInstance &print_instance = obj->instances()[0];
         const ModelInstance *model_instance = print_instance.model_instance;
         size_t identify_id = (model_instance->loaded_id > 0)?model_instance->loaded_id: model_instance->id().id;
-        std::string file_name = directory +"/obj_"+std::to_string(identify_id)+".json";
+        std::string file_name = directory +"/obj_"+std::to_string(identify_id)+".bin";
 
         BOOST_LOG_TRIVIAL(info) << boost::format("begin to dump object %1%, identify_id %2% to %3%")%model_obj->name %identify_id %file_name;
-
-        try {
-            json root_json, layers_json = json::array(), support_layers_json = json::array(), first_layer_groups = json::array();
-
-            root_json[JSON_OBJECT_NAME] = model_obj->name;
-            root_json[JSON_IDENTIFY_ID] = identify_id;
-
-            //export the layers
-            std::vector<json> layers_json_vector(obj->layer_count());
-            tbb::parallel_for(
-                tbb::blocked_range<size_t>(0, obj->layer_count()),
-                [&layers_json_vector, obj, convert_layer_to_json](const tbb::blocked_range<size_t>& layer_range) {
-                    for (size_t layer_index = layer_range.begin(); layer_index < layer_range.end(); ++ layer_index) {
-                        const Layer *layer = obj->get_layer(layer_index);
-                        json layer_json;
-                        convert_layer_to_json(layer_json, layer);
-                        layers_json_vector[layer_index] = std::move(layer_json);
-                    }
-                }
-            );
-            for (int l_index = 0; l_index < layers_json_vector.size(); l_index++) {
-                layers_json.push_back(std::move(layers_json_vector[l_index]));
-            }
-            layers_json_vector.clear();
-            /*for (const Layer *layer : obj->layers()) {
-                // for each layer
-                json layer_json;
-
-                convert_layer_to_json(layer_json, layer);
-
-                layers_json.push_back(std::move(layer_json));
-            }*/
-
-            root_json[JSON_LAYERS] = std::move(layers_json);
-
-            //export the support layers
-            std::vector<json> support_layers_json_vector(obj->support_layer_count());
-            tbb::parallel_for(
-                tbb::blocked_range<size_t>(0, obj->support_layer_count()),
-                [&support_layers_json_vector, obj, convert_layer_to_json](const tbb::blocked_range<size_t>& support_layer_range) {
-                    for (size_t s_layer_index = support_layer_range.begin(); s_layer_index < support_layer_range.end(); ++ s_layer_index) {
-                        const SupportLayer *support_layer = obj->get_support_layer(s_layer_index);
-                        json support_layer_json, support_islands_json = json::array(), support_fills_json, supportfills_entities_json = json::array();
-
-                        convert_layer_to_json(support_layer_json, support_layer);
-
-                        support_layer_json[JSON_SUPPORT_LAYER_INTERFACE_ID] = support_layer->interface_id();
-                        support_layer_json[JSON_SUPPORT_LAYER_TYPE] = support_layer->support_type;
-
-                        //support_islands
-                        for (const ExPolygon& support_island : support_layer->support_islands) {
-                            json support_island_json = support_island;
-                            support_islands_json.push_back(std::move(support_island_json));
-                        }
-                        support_layer_json[JSON_SUPPORT_LAYER_ISLANDS] = std::move(support_islands_json);
-
-                        //support_fills
-                        support_fills_json[JSON_EXTRUSION_NO_SORT] = support_layer->support_fills.no_sort;
-                        support_fills_json[JSON_EXTRUSION_ENTITY_TYPE] = JSON_EXTRUSION_TYPE_COLLECTION;
-                        for (const ExtrusionEntity* extrusion_entity : support_layer->support_fills.entities) {
-                            json supportfill_entity_json, supportfill_entity_paths_json = json::array();
-                            bool ret = convert_extrusion_to_json(supportfill_entity_json, supportfill_entity_paths_json, extrusion_entity);
-                            if (!ret)
-                                continue;
-
-                            supportfills_entities_json.push_back(std::move(supportfill_entity_json));
-                        }
-                        support_fills_json[JSON_EXTRUSION_ENTITIES] = std::move(supportfills_entities_json);
-                        support_layer_json[JSON_SUPPORT_LAYER_FILLS] = std::move(support_fills_json);
-
-                        support_layers_json_vector[s_layer_index] = std::move(support_layer_json);
-                    }
-                }
-            );
-            for (int s_index = 0; s_index < support_layers_json_vector.size(); s_index++) {
-                support_layers_json.push_back(std::move(support_layers_json_vector[s_index]));
-            }
-            support_layers_json_vector.clear();
-
-            /*for (const SupportLayer *support_layer : obj->support_layers()) {
-                json support_layer_json, support_islands_json = json::array(), support_fills_json, supportfills_entities_json = json::array();
-
-                convert_layer_to_json(support_layer_json, support_layer);
-
-                support_layer_json[JSON_SUPPORT_LAYER_INTERFACE_ID] = support_layer->interface_id();
-
-                //support_islands
-                for (const ExPolygon& support_island : support_layer->support_islands.expolygons) {
-                    json support_island_json = support_island;
-                    support_islands_json.push_back(std::move(support_island_json));
-                }
-                support_layer_json[JSON_SUPPORT_LAYER_ISLANDS] = std::move(support_islands_json);
-
-                //support_fills
-                support_fills_json[JSON_EXTRUSION_NO_SORT] = support_layer->support_fills.no_sort;
-                support_fills_json[JSON_EXTRUSION_ENTITY_TYPE] = JSON_EXTRUSION_TYPE_COLLECTION;
-                for (const ExtrusionEntity* extrusion_entity : support_layer->support_fills.entities) {
-                    json supportfill_entity_json, supportfill_entity_paths_json = json::array();
-                    bool ret = convert_extrusion_to_json(supportfill_entity_json, supportfill_entity_paths_json, extrusion_entity);
-                    if (!ret)
-                        continue;
-
-                    supportfills_entities_json.push_back(std::move(supportfill_entity_json));
-                }
-                support_fills_json[JSON_EXTRUSION_ENTITIES] = std::move(supportfills_entities_json);
-                support_layer_json[JSON_SUPPORT_LAYER_FILLS] = std::move(support_fills_json);
-
-                support_layers_json.push_back(std::move(support_layer_json));
-            } // for each layer*/
-            root_json[JSON_SUPPORT_LAYERS] = std::move(support_layers_json);
-
-            const std::vector<groupedVolumeSlices> &first_layer_obj_groups =  obj->firstLayerObjGroups();
-            for (size_t s_group_index = 0; s_group_index < first_layer_obj_groups.size(); ++ s_group_index) {
-                groupedVolumeSlices group = first_layer_obj_groups[s_group_index];
-
-                //convert the id
-                for (ObjectID& obj_id : group.volume_ids)
-                {
-                    const ModelVolume* currentModelVolumePtr = nullptr;
-                    //BBS: support shared object logic
-                    const PrintObject* shared_object = obj->get_shared_object();
-                    if (!shared_object)
-                        shared_object = obj;
-                    const ModelVolumePtrs& volumes_ptr = shared_object->model_object()->volumes;
-                    size_t volume_count = volumes_ptr.size();
-                    for (size_t index = 0; index < volume_count; index ++) {
-                        currentModelVolumePtr = volumes_ptr[index];
-                        if (currentModelVolumePtr->id() == obj_id) {
-                            obj_id.id = index;
-                            break;
-                        }
-                    }
-                }
-
-                json first_layer_group_json;
-
-                first_layer_group_json = group;
-                first_layer_groups.push_back(std::move(first_layer_group_json));
-            }
-            root_json[JSON_FIRSTLAYER_GROUPS] = std::move(first_layer_groups);
-
-            filename_vector.push_back(file_name);
-            json_vector.push_back(std::move(root_json));
-            /*boost::nowide::ofstream c;
-            c.open(file_name, std::ios::out | std::ios::trunc);
-            if (with_space)
-                c << root_json.dump(1, '\t') << std::endl;
-            else
-                c << root_json.dump(0) << std::endl;
-            c.close();*/
-            count ++;
-            BOOST_LOG_TRIVIAL(info) << boost::format("will dump object %1%'s json to %2%.")%model_obj->name%file_name;
-        }
-        catch(std::exception &err) {
-            BOOST_LOG_TRIVIAL(error) << __FUNCTION__<< ": save to "<<file_name<<" got a generic exception, reason = " << err.what();
-            ret = CLI_EXPORT_CACHE_WRITE_FAILED;
-        }
+        entries.push_back({file_name, obj, model_obj->name, identify_id});
     }
 
+    std::vector<std::vector<uint8_t>> buffers(entries.size());
     boost::mutex mutex;
     tbb::parallel_for(
-        tbb::blocked_range<size_t>(0, filename_vector.size()),
-        [filename_vector, &json_vector, with_space, &ret, &mutex](const tbb::blocked_range<size_t>& output_range) {
-            for (size_t object_index = output_range.begin(); object_index < output_range.end(); ++ object_index) {
+        tbb::blocked_range<size_t>(0, entries.size()),
+        [&entries, &buffers, &ret, &mutex](const tbb::blocked_range<size_t>& obj_range) {
+            for (size_t e_index = obj_range.begin(); e_index < obj_range.end(); ++ e_index) {
+                PrintObject* obj = entries[e_index].obj;
                 try {
-                    boost::nowide::ofstream c;
-                    c.open(filename_vector[object_index], std::ios::out | std::ios::trunc);
-                    if (with_space)
-                        c << json_vector[object_index].dump(1, '\t') << std::endl;
-                    else
-                        c << json_vector[object_index].dump(0) << std::endl;
-                    c.close();
+                    Writer w;
+                    w.str(entries[e_index].name);
+                    w.u64((uint64_t)entries[e_index].identify_id);
+
+                    //export the layers
+                    w.u32((uint32_t)obj->layer_count());
+                    for (int l_index = 0; l_index < (int)obj->layer_count(); ++l_index) {
+                        const Layer *layer = obj->get_layer(l_index);
+                        w.f64(layer->print_z);
+                        w.f64(layer->height);
+                        w.f64(layer->slice_z);
+                        w.u64((uint64_t)layer->id());
+                        write_layer_geometry_and_regions(w, *layer);
+                    }
+
+                    //export the support layers
+                    w.u32((uint32_t)obj->support_layer_count());
+                    for (int s_index = 0; s_index < (int)obj->support_layer_count(); ++s_index) {
+                        const SupportLayer *support_layer = obj->get_support_layer(s_index);
+                        w.f64(support_layer->print_z);
+                        w.f64(support_layer->height);
+                        w.f64(support_layer->slice_z);
+                        w.u64((uint64_t)support_layer->id());
+                        w.u64((uint64_t)support_layer->interface_id());
+                        write_layer_geometry_and_regions(w, *support_layer);
+                        w.u8((uint8_t)support_layer->support_type);
+                        w.u32((uint32_t)support_layer->support_islands.size());
+                        for (const ExPolygon& island : support_layer->support_islands) write_expolygon(w, island);
+                        write_entity_collection_fields(w, support_layer->support_fills);
+                    }
+
+                    //first layer groups (volume ids remapped to an index into the source object's volumes)
+                    const std::vector<groupedVolumeSlices> &first_layer_obj_groups = obj->firstLayerObjGroups();
+                    w.u32((uint32_t)first_layer_obj_groups.size());
+                    for (const groupedVolumeSlices& group_orig : first_layer_obj_groups) {
+                        groupedVolumeSlices group = group_orig;
+                        for (ObjectID& obj_id : group.volume_ids) {
+                            const ModelVolume* currentModelVolumePtr = nullptr;
+                            const PrintObject* shared_object = obj->get_shared_object();
+                            if (!shared_object) shared_object = obj;
+                            const ModelVolumePtrs& volumes_ptr = shared_object->model_object()->volumes;
+                            size_t volume_count = volumes_ptr.size();
+                            for (size_t index = 0; index < volume_count; index++) {
+                                currentModelVolumePtr = volumes_ptr[index];
+                                if (currentModelVolumePtr->id() == obj_id) {
+                                    obj_id.id = index;
+                                    break;
+                                }
+                            }
+                        }
+                        write_grouped_volume_slices(w, group);
+                    }
+
+                    buffers[e_index] = std::move(w.buf);
                 }
                 catch(std::exception &err) {
-                    BOOST_LOG_TRIVIAL(error) << __FUNCTION__<< ": save to "<<filename_vector[object_index]<<" got a generic exception, reason = " << err.what();
+                    BOOST_LOG_TRIVIAL(error) << __FUNCTION__<< ": serialize "<<entries[e_index].name<<" got a generic exception, reason = " << err.what();
                     boost::unique_lock l(mutex);
                     ret = CLI_EXPORT_CACHE_WRITE_FAILED;
                 }
@@ -5695,13 +5239,33 @@ int Print::export_cached_data(const std::string& directory, bool with_space)
         }
     );
 
-    BOOST_LOG_TRIVIAL(info) << __FUNCTION__<< boost::format(": total printobject count %1%, saved %2%, ret=%3%")%m_objects.size() %count %ret;
+    tbb::parallel_for(
+        tbb::blocked_range<size_t>(0, entries.size()),
+        [&entries, &buffers, &ret, &mutex](const tbb::blocked_range<size_t>& output_range) {
+            for (size_t object_index = output_range.begin(); object_index < output_range.end(); ++ object_index) {
+                try {
+                    boost::nowide::ofstream c;
+                    c.open(entries[object_index].filename, std::ios::out | std::ios::trunc | std::ios::binary);
+                    c.write(reinterpret_cast<const char*>(buffers[object_index].data()), (std::streamsize)buffers[object_index].size());
+                    c.close();
+                }
+                catch(std::exception &err) {
+                    BOOST_LOG_TRIVIAL(error) << __FUNCTION__<< ": save to "<<entries[object_index].filename<<" got a generic exception, reason = " << err.what();
+                    boost::unique_lock l(mutex);
+                    ret = CLI_EXPORT_CACHE_WRITE_FAILED;
+                }
+            }
+        }
+    );
+
+    BOOST_LOG_TRIVIAL(info) << __FUNCTION__<< boost::format(": total printobject count %1%, saved %2%, ret=%3%")%m_objects.size() %entries.size() %ret;
     return ret;
 }
 
 
 int Print::load_cached_data(const std::string& directory)
 {
+    using namespace SliceCacheBin;
     int ret = 0;
     boost::filesystem::path directory_path(directory);
 
@@ -5709,18 +5273,6 @@ int Print::load_cached_data(const std::string& directory)
         BOOST_LOG_TRIVIAL(info) << boost::format("directory %1% not exist.")%directory;
         return CLI_IMPORT_CACHE_NOT_FOUND;
     }
-
-    auto find_region = [](PrintObject* object, size_t config_hash) -> const PrintRegion* {
-        int regions_count = object->num_printing_regions();
-        for (int index = 0; index < regions_count; index++ )
-        {
-            const PrintRegion&  print_region = object->printing_region(index);
-            if (print_region.config_hash() == config_hash ) {
-                return &print_region;
-            }
-        }
-        return NULL;
-    };
 
     int count = 0;
     std::vector<std::pair<std::string, PrintObject*>> object_filenames;
@@ -5739,7 +5291,7 @@ int Print::load_cached_data(const std::string& directory)
             BOOST_LOG_TRIVIAL(info) << __FUNCTION__<< boost::format(": object %1%'s loaded_id is 0, need to use the instance_id %2%")%model_obj->name %identify_id;
             //continue;
         }
-        std::string file_name = directory +"/obj_"+std::to_string(identify_id)+".json";
+        std::string file_name = directory +"/obj_"+std::to_string(identify_id)+".bin";
 
         if (!fs::exists(file_name)) {
             BOOST_LOG_TRIVIAL(info) << __FUNCTION__<<boost::format(": file %1% not exist, maybe a shared object, skip it")%file_name;
@@ -5749,16 +5301,20 @@ int Print::load_cached_data(const std::string& directory)
     }
 
     boost::mutex mutex;
-    std::vector<json> object_jsons(object_filenames.size());
+    std::vector<std::vector<uint8_t>> object_data(object_filenames.size());
     tbb::parallel_for(
         tbb::blocked_range<size_t>(0, object_filenames.size()),
-        [object_filenames, &ret, &object_jsons, &mutex](const tbb::blocked_range<size_t>& filename_range) {
+        [&object_filenames, &ret, &object_data, &mutex](const tbb::blocked_range<size_t>& filename_range) {
             for (size_t filename_index = filename_range.begin(); filename_index < filename_range.end(); ++ filename_index) {
                 try {
-                    json root_json;
-                    boost::nowide::ifstream ifs(object_filenames[filename_index].first);
-                    ifs >> root_json;
-                    object_jsons[filename_index] = std::move(root_json);
+                    boost::nowide::ifstream ifs(object_filenames[filename_index].first, std::ios::binary);
+                    ifs.seekg(0, std::ios::end);
+                    std::streamoff size = ifs.tellg();
+                    ifs.seekg(0, std::ios::beg);
+                    std::vector<uint8_t> data((size_t)size);
+                    if (size > 0)
+                        ifs.read(reinterpret_cast<char*>(data.data()), size);
+                    object_data[filename_index] = std::move(data);
                 }
                 catch(std::exception &err) {
                     BOOST_LOG_TRIVIAL(error) << __FUNCTION__<< ": load from "<<object_filenames[filename_index].first<<" got a generic exception, reason = " << err.what();
@@ -5770,35 +5326,28 @@ int Print::load_cached_data(const std::string& directory)
     );
 
     if (ret) {
-        BOOST_LOG_TRIVIAL(error) << __FUNCTION__<< boost::format(": load json failed.");
+        BOOST_LOG_TRIVIAL(error) << __FUNCTION__<< boost::format(": load binary cache failed.");
         return ret;
     }
 
-    for (int obj_index = 0; obj_index < object_jsons.size(); obj_index++) {
-        json& root_json = object_jsons[obj_index];
+    for (int obj_index = 0; obj_index < (int)object_data.size(); obj_index++) {
         PrintObject *obj = object_filenames[obj_index].second;
 
         try {
-            //boost::nowide::ifstream ifs(file_name);
-            //ifs >> root_json;
+            Reader r(object_data[obj_index].data(), object_data[obj_index].size());
+            std::string name = r.str();
+            uint64_t identify_id = r.u64();
+            uint32_t layer_count = r.u32();
 
-            std::string name = root_json.at(JSON_OBJECT_NAME);
-            int identify_id = root_json.at(JSON_IDENTIFY_ID);
-            int layer_count = 0, support_layer_count = 0, firstlayer_group_count = 0;
-
-            layer_count = root_json[JSON_LAYERS].size();
-            support_layer_count = root_json[JSON_SUPPORT_LAYERS].size();
-            firstlayer_group_count = root_json[JSON_FIRSTLAYER_GROUPS].size();
-
-            BOOST_LOG_TRIVIAL(info) << __FUNCTION__<<boost::format(":will load %1%, identify_id %2%, layer_count %3%, support_layer_count %4%, firstlayer_group_count %5%")
-                %name %identify_id %layer_count %support_layer_count %firstlayer_group_count;
+            BOOST_LOG_TRIVIAL(info) << __FUNCTION__<<boost::format(":will load %1%, identify_id %2%, layer_count %3%")
+                %name %identify_id %layer_count;
 
             Layer* previous_layer = NULL;
-            //create layer and layer regions
-            for (int index = 0; index < layer_count; index++)
+            for (uint32_t l_index = 0; l_index < layer_count; l_index++)
             {
-                json& layer_json = root_json[JSON_LAYERS][index];
-                Layer* new_layer = obj->add_layer(layer_json[JSON_LAYER_ID], layer_json[JSON_LAYER_HEIGHT], layer_json[JSON_LAYER_PRINT_Z], layer_json[JSON_LAYER_SLICE_Z]);
+                double print_z = r.f64(), height = r.f64(), slice_z = r.f64();
+                uint64_t layer_id = r.u64();
+                Layer* new_layer = obj->add_layer((int)layer_id, height, print_z, slice_z);
                 if (!new_layer) {
                     BOOST_LOG_TRIVIAL(error) <<__FUNCTION__<< boost::format(":create_layer failed, out of memory");
                     return CLI_OUT_OF_MEMORY;
@@ -5809,46 +5358,24 @@ int Print::load_cached_data(const std::string& directory)
                 }
                 previous_layer = new_layer;
 
-                //layer regions
-                int layer_regions_count = layer_json[JSON_LAYER_REGIONS].size();
-                for (int region_index = 0; region_index < layer_regions_count; region_index++)
-                {
-                    json& region_json = layer_json[JSON_LAYER_REGIONS][region_index];
-                    size_t config_hash = region_json[JSON_LAYER_REGION_CONFIG_HASH];
-                    const PrintRegion *print_region = find_region(obj, config_hash);
-
-                    if (!print_region){
-                        BOOST_LOG_TRIVIAL(error) <<__FUNCTION__<< boost::format(":can not find print region of object %1%, layer %2%, print_z %3%, layer_region %4%")
-                            %name % index %new_layer->print_z %region_index;
-                        //delete new_layer;
-                        return CLI_IMPORT_CACHE_DATA_CAN_NOT_USE;
-                    }
-
-                    new_layer->add_region(print_region);
+                try {
+                    read_layer_geometry_and_regions(r, obj, new_layer, name);
                 }
-
+                catch (Slic3r::FileIOError&) {
+                    BOOST_LOG_TRIVIAL(error) <<__FUNCTION__<< boost::format(":can not find print region of object %1%, layer %2%, print_z %3%")
+                        %name % l_index %new_layer->print_z;
+                    return CLI_IMPORT_CACHE_DATA_CAN_NOT_USE;
+                }
             }
 
-            //load the layer data parallel
-            BOOST_LOG_TRIVIAL(info) << __FUNCTION__<<boost::format(": load the layers in parallel");
-            tbb::parallel_for(
-                tbb::blocked_range<size_t>(0, obj->layer_count()),
-                [&root_json, &obj](const tbb::blocked_range<size_t>& layer_range) {
-                    for (size_t layer_index = layer_range.begin(); layer_index < layer_range.end(); ++ layer_index) {
-                        const json& layer_json = root_json[JSON_LAYERS][layer_index];
-                        Layer* layer = obj->get_layer(layer_index);
-                        extract_layer(layer_json, *layer);
-                    }
-                }
-            );
-
-            //support layers
+            uint32_t support_layer_count = r.u32();
             Layer* previous_support_layer = NULL;
-            //create support_layers
-            for (int index = 0; index < support_layer_count; index++)
+            for (uint32_t s_index = 0; s_index < support_layer_count; s_index++)
             {
-                json& layer_json = root_json[JSON_SUPPORT_LAYERS][index];
-                SupportLayer* new_support_layer = obj->add_support_layer(layer_json[JSON_LAYER_ID], layer_json[JSON_SUPPORT_LAYER_INTERFACE_ID], layer_json[JSON_LAYER_HEIGHT], layer_json[JSON_LAYER_PRINT_Z]);
+                double print_z = r.f64(), height = r.f64(), slice_z = r.f64();
+                uint64_t layer_id = r.u64();
+                uint64_t interface_id = r.u64();
+                SupportLayer* new_support_layer = obj->add_support_layer((int)layer_id, (int)interface_id, height, print_z);
                 if (!new_support_layer) {
                     BOOST_LOG_TRIVIAL(error) <<__FUNCTION__<< boost::format(":add_support_layer failed, out of memory");
                     return CLI_OUT_OF_MEMORY;
@@ -5858,26 +5385,21 @@ int Print::load_cached_data(const std::string& directory)
                     new_support_layer->lower_layer = previous_support_layer;
                 }
                 previous_support_layer = new_support_layer;
+
+                read_layer_geometry_and_regions(r, obj, new_support_layer, name);
+                new_support_layer->support_type = (SupportInnerType)r.u8();
+                uint32_t islands_count = r.u32();
+                for (uint32_t i = 0; i < islands_count; ++i) { ExPolygon p; read_expolygon(r, p); new_support_layer->support_islands.push_back(std::move(p)); }
+                read_entity_collection_fields(r, new_support_layer->support_fills);
             }
 
-            BOOST_LOG_TRIVIAL(info) << __FUNCTION__<< boost::format(": finished load layers, start to load support_layers.");
-            tbb::parallel_for(
-                tbb::blocked_range<size_t>(0, obj->support_layer_count()),
-                [&root_json, &obj](const tbb::blocked_range<size_t>& support_layer_range) {
-                    for (size_t layer_index = support_layer_range.begin(); layer_index < support_layer_range.end(); ++ layer_index) {
-                        const json& layer_json = root_json[JSON_SUPPORT_LAYERS][layer_index];
-                        SupportLayer* support_layer = obj->get_support_layer(layer_index);
-                        extract_support_layer(layer_json, *support_layer);
-                    }
-                }
-            );
-
             //load first group volumes
+            uint32_t firstlayer_group_count = r.u32();
             std::vector<groupedVolumeSlices>& firstlayer_objgroups = obj->firstLayerObjGroupsMod();
-            for (int index = 0; index < firstlayer_group_count; index++)
+            for (uint32_t index = 0; index < firstlayer_group_count; index++)
             {
-                json& firstlayer_group_json = root_json[JSON_FIRSTLAYER_GROUPS][index];
-                groupedVolumeSlices firstlayer_group = firstlayer_group_json;
+                groupedVolumeSlices firstlayer_group;
+                read_grouped_volume_slices(r, firstlayer_group);
                 //convert the id
                 for (ObjectID& obj_id : firstlayer_group.volume_ids)
                 {
@@ -5900,17 +5422,13 @@ int Print::load_cached_data(const std::string& directory)
             count ++;
             BOOST_LOG_TRIVIAL(info) << __FUNCTION__<< boost::format(": load object %1% from %2% successfully.")%count%object_filenames[obj_index].first;
         }
-        catch(nlohmann::detail::parse_error &err) {
-            BOOST_LOG_TRIVIAL(error) << __FUNCTION__<< ": parse "<<object_filenames[obj_index].first<<" got a nlohmann::detail::parse_error, reason = " << err.what();
-            return CLI_IMPORT_CACHE_LOAD_FAILED;
-        }
         catch(std::exception &err) {
             BOOST_LOG_TRIVIAL(error) << __FUNCTION__<< ": load from "<<object_filenames[obj_index].first<<" got a generic exception, reason = " << err.what();
             ret = CLI_IMPORT_CACHE_LOAD_FAILED;
         }
     }
 
-    object_jsons.clear();
+    object_data.clear();
     object_filenames.clear();
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__<< boost::format(": total printobject count %1%, loaded %2%, ret=%3%")%m_objects.size() %count %ret;
     return ret;
