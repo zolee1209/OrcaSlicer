@@ -4857,7 +4857,13 @@ static void to_json(json& j, const Polyline& poly_line) {
 }
 
 static void to_json(json& j, const ExtrusionPath& extrusion_path) {
-    j[JSON_EXTRUSION_POLYLINE] = extrusion_path.polyline;
+    // ORCA: extrusion_path.polyline is a Polyline3 (has a Z coordinate per point), but only the
+    // custom to_json/from_json for the 2D Polyline type is implemented below. Serializing the
+    // Polyline3 directly falls back to nlohmann's generic container serialization (a plain
+    // [[x,y,z],...] array), which the matching from_json (expecting the Polyline object format)
+    // cannot parse (throws json::type_error 305). Project down to 2D first, matching what
+    // from_json(ExtrusionPath) already does on load (it reconstructs the Polyline3 with z=0).
+    j[JSON_EXTRUSION_POLYLINE] = extrusion_path.polyline.to_polyline();
     j[JSON_EXTRUSION_MM3_PER_MM] = extrusion_path.mm3_per_mm;
     j[JSON_EXTRUSION_WIDTH] = extrusion_path.width;
     j[JSON_EXTRUSION_HEIGHT] = extrusion_path.height;
