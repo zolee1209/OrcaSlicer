@@ -40,6 +40,9 @@ src/OrcaSlicer-doc/
 **/.flatpak-builder/
 *.no-debug.yml
 resources/profiles/user/default
+
+# Kilo Code agent tool state (local, not project source)
+/.kilo/
 *.code-workspace
 deps_src/build/
 test.js
