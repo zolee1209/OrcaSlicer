@@ -87,7 +87,7 @@
         "0.1"
     ],
     "max_layer_height": [
-        "0.4"
+        "0.5"
     ],
     "extruder_clearance_radius": "45",
     "extruder_clearance_height_to_rod": "25",
