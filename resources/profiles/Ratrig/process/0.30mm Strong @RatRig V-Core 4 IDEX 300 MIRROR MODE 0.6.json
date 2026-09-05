@@ -1,0 +1,46 @@
+{
+    "type": "process",
+    "name": "0.30mm Strong @RatRig V-Core 4 IDEX 300 MIRROR MODE 0.6",
+    "inherits": "fdm_process_ratrig_common",
+    "from": "system",
+    "setting_id": "GP006",
+    "instantiation": "true",
+    "bottom_shell_layers": "3",
+    "bridge_flow": "0.85",
+    "compatible_printers": [
+        "RatRig V-Core 4 IDEX 300 MIRROR MODE 0.6 nozzle"
+    ],
+    "elefant_foot_compensation": "0.1",
+    "infill_anchor": "600%",
+    "infill_anchor_max": "5",
+    "infill_combination": "1",
+    "infill_wall_overlap": "18%",
+    "inital_layer_height": "0.3",
+    "initial_layer_line_width": "100%",
+    "initial_layer_print_height": "0.3",
+    "inner_wall_line_width": "100%",
+    "internal_solid_infill_line_width": "100%",
+    "layer_height": "0.3",
+    "line_width": "100%",
+    "outer_wall_line_width": "100%",
+    "resolution": "0.001",
+    "skirt_distance": "10",
+    "skirt_loops": "2",
+    "sparse_infill_density": "25%",
+    "sparse_infill_line_width": "100%",
+    "support_bottom_z_distance": "0.2",
+    "support_line_width": "100%",
+    "support_object_xy_distance": "60%",
+    "support_on_build_plate_only": "1",
+    "support_threshold_angle": "65",
+    "top_shell_layers": "4",
+    "top_shell_thickness": "0",
+    "top_surface_line_width": "100%",
+    "wall_count": "4",
+    "print_extruder_id": [
+        "1"
+    ],
+    "print_extruder_variant": [
+        "Direct Drive Standard"
+    ]
+}
