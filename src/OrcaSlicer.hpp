@@ -133,6 +133,11 @@ private:
 
     bool has_print_action() const { return m_config.opt_bool("export_gcode") || m_config.opt_bool("export_sla"); }
 
+    // Orca custom: standalone G-code statistics recompute action (see
+    // CLIActionsConfigDef::gcode_stats in PrintConfig.cpp for the CLI flags).
+    // No mesh/model is loaded for this action.
+    int run_gcode_stats_action(const std::string &gcode_file, const std::string &out_path) const;
+
     std::string output_filepath(const Model &model, IO::ExportFormat format) const;
     std::string output_filepath(const ModelObject &object, unsigned int index, IO::ExportFormat format, std::string path_dir) const;
 };

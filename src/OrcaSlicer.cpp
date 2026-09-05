@@ -57,6 +57,7 @@ using namespace nlohmann;
 #include "libslic3r/Config.hpp"
 #include "libslic3r/Geometry.hpp"
 #include "libslic3r/GCode.hpp"
+#include "libslic3r/GCode/GCodeProcessor.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/ModelArrange.hpp"
 #include "libslic3r/Platform.hpp"
@@ -1220,6 +1221,75 @@ static void load_downward_settings_list_from_config(std::string config_file, std
     }
 }
 
+// Orca custom: standalone G-code statistics recompute action.
+// Loads an already-sliced .gcode file directly via GCodeProcessor::process_file()
+// (no mesh, no model, no re-slicing -- the same engine the GUI uses to preview a
+// foreign G-code file) and prints the recomputed time/filament statistics as JSON.
+int CLI::run_gcode_stats_action(const std::string &gcode_file, const std::string &out_path) const
+{
+    if (!boost::filesystem::exists(gcode_file)) {
+        boost::nowide::cerr << "gcode_stats: no such file: " << gcode_file << std::endl;
+        return CLI_FILE_NOTFOUND;
+    }
+
+    GCodeProcessor processor;
+    try {
+        processor.process_file(gcode_file);
+    } catch (const std::exception &ex) {
+        boost::nowide::cerr << "gcode_stats: failed to process " << gcode_file << ": " << ex.what() << std::endl;
+        return CLI_CONFIG_FILE_ERROR;
+    }
+
+    // GCodeProcessorResult holds a mutex (non-copyable/non-movable), so it is
+    // default-constructed and filled via its custom operator= (same pattern as
+    // Plater.cpp/Print.cpp), not copy/move-initialized from extract_result().
+    GCodeProcessorResult result;
+    result = processor.extract_result();
+    const auto &ps = result.print_statistics;
+    const auto normal_mode  = static_cast<size_t>(PrintEstimatedStatistics::ETimeMode::Normal);
+    const auto silent_mode  = static_cast<size_t>(PrintEstimatedStatistics::ETimeMode::Stealth);
+
+    json j;
+    j["file"]                    = gcode_file;
+    j["time_normal_s"]           = ps.modes[normal_mode].time;
+    j["time_silent_s"]           = ps.modes[silent_mode].time;
+    j["prepare_time_normal_s"]   = ps.modes[normal_mode].prepare_time;
+    j["total_travel_distance_mm"] = ps.total_travel_distance;
+    j["total_travel_moves"]      = ps.total_travel_moves;
+
+    json extruders = json::array();
+    for (const auto &kv : ps.total_volumes_per_extruder) {
+        const size_t extruder_id = kv.first;
+        const double volume_mm3  = kv.second;
+        json e;
+        e["extruder_id"] = extruder_id;
+        e["volume_mm3"]  = volume_mm3;
+        if (extruder_id < result.filament_densities.size()) {
+            const double density_g_cm3 = result.filament_densities[extruder_id];
+            const double weight_g      = volume_mm3 * density_g_cm3 / 1000.0;
+            e["weight_g"] = weight_g;
+            if (extruder_id < result.filament_costs.size())
+                e["cost"] = weight_g / 1000.0 * result.filament_costs[extruder_id];
+        }
+        extruders.push_back(e);
+    }
+    j["extruders"] = extruders;
+
+    const std::string out_str = j.dump(2);
+    if (!out_path.empty()) {
+        boost::nowide::ofstream ofs(out_path);
+        if (!ofs.good()) {
+            boost::nowide::cerr << "gcode_stats: can not open output file: " << out_path << std::endl;
+            return CLI_CONFIG_FILE_ERROR;
+        }
+        ofs << out_str;
+        BOOST_LOG_TRIVIAL(info) << "gcode_stats: wrote " << out_path;
+    } else {
+        boost::nowide::cout << out_str << std::endl;
+    }
+    return 0;
+}
+
 int CLI::run(int argc, char **argv)
 {
     // Mark the main thread for the debugger and for runtime checks.
@@ -1353,6 +1423,15 @@ int CLI::run(int argc, char **argv)
         return CLI_INVALID_PARAMS;
     }
     BOOST_LOG_TRIVIAL(info) << "finished setup params, argc="<< argc << std::endl;
+
+    // Orca custom: --gcode-stats short-circuits everything else -- no model file,
+    // no GUI, no slicing. Handled here, right after CLI arg parsing.
+    {
+        const std::string gcode_stats_file = m_config.opt_string("gcode_stats");
+        if (!gcode_stats_file.empty())
+            return this->run_gcode_stats_action(gcode_stats_file, m_config.opt_string("gcode_stats_out"));
+    }
+
     std::string temp_path = per_user_temp_dir(wxFileName::GetTempDir().utf8_str().data(), per_user_temp_id());
     // Some consumers write into the temp root directly, so create it up front.
     try {

@@ -11971,6 +11971,25 @@ CLIActionsConfigDef::CLIActionsConfigDef()
     def->cli_params = "slicing_data_directory";
     def->set_default_value(new ConfigOptionString("cached_data"));
 
+    // Orca custom: standalone G-code statistics recompute.
+    // Loads an already-sliced (and optionally externally rewritten, e.g. F/E
+    // rescaled for a different filament) .gcode file directly -- no mesh, no
+    // model, no re-slicing -- and prints the recomputed time/filament
+    // statistics as JSON (GCodeProcessor::process_file(), the same engine used
+    // by the GUI's "open a foreign G-code in Preview" feature). Exits
+    // immediately, before any model file is loaded.
+    def = this->add("gcode_stats", coString);
+    def->label = L("Recompute G-code statistics");
+    def->tooltip = L("Load a G-code file directly (no mesh/re-slicing) and print the recomputed time/filament statistics as JSON.");
+    def->cli_params = "input.gcode";
+    def->set_default_value(new ConfigOptionString(""));
+
+    def = this->add("gcode_stats_out", coString);
+    def->label = L("G-code statistics output file");
+    def->tooltip = L("With --gcode-stats, write the JSON statistics to this file instead of stdout.");
+    def->cli_params = "output.json";
+    def->set_default_value(new ConfigOptionString(""));
+
     /*def = this->add("export_amf", coBool);
     def->label = L("Export AMF");
     def->tooltip = L("Export the model(s) as AMF.");
