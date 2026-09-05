@@ -3,7 +3,7 @@
     "name": "0.05mm Normal @RatRig V-Core 4 500 0.1",
     "inherits": "fdm_process_ratrig_common",
     "from": "system",
-    "setting_id": "GP006",
+    "setting_id": "98lUUEueQF5ghfm0",
     "instantiation": "true",
     "bottom_shell_layers": "3",
     "bridge_flow": "0.85",

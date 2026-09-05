@@ -3,7 +3,7 @@
     "name": "0.30mm Normal @RatRig V-Core 4 IDEX 300 MIRROR MODE 0.6",
     "inherits": "fdm_process_ratrig_common",
     "from": "system",
-    "setting_id": "GP006",
+    "setting_id": "ky8GMA1E1cIR6B4r",
     "instantiation": "true",
     "bottom_shell_layers": "3",
     "bridge_flow": "0.85",

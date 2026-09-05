@@ -3,7 +3,7 @@
     "name": "0.40mm Strong @RatRig V-Core 4 300 0.8",
     "inherits": "fdm_process_ratrig_common",
     "from": "system",
-    "setting_id": "GP006",
+    "setting_id": "BPEsZ6eBYBj9U2Av",
     "instantiation": "true",
     "bottom_shell_layers": "3",
     "bridge_flow": "0.85",

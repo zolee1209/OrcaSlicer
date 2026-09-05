@@ -3,7 +3,7 @@
     "name": "0.30mm Strong @RatRig V-Core 4 IDEX 500 0.6",
     "inherits": "fdm_process_ratrig_common",
     "from": "system",
-    "setting_id": "GP006",
+    "setting_id": "gQR02p2HHM06m0qg",
     "instantiation": "true",
     "bottom_shell_layers": "3",
     "bridge_flow": "0.85",

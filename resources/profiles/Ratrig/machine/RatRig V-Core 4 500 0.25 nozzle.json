@@ -3,7 +3,7 @@
     "name": "RatRig V-Core 4 500 0.25 nozzle",
     "inherits": "fdm_klipper_common",
     "from": "system",
-    "setting_id": "GM002",
+    "setting_id": "ylKI4m3xMMI5yOlC",
     "instantiation": "true",
     "printer_model": "RatRig V-Core 4 500",
     "printer_variant": "0.25",

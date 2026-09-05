@@ -3,7 +3,7 @@
     "name": "RatRig V-Core 4 IDEX 300 1.8 nozzle",
     "inherits": "fdm_klipper_common",
     "from": "system",
-    "setting_id": "GM002",
+    "setting_id": "qgkFCP4xcbEdlaB2",
     "instantiation": "true",
     "printer_model": "RatRig V-Core 4 IDEX 300",
     "printer_variant": "1.8",
