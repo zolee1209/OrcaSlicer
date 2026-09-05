@@ -3491,6 +3491,8 @@ void Print::export_gcode_from_previous_file(const std::string& file, GCodeProces
         processor.process_file(file);
 
         *result = std::move(processor.extract_result());
+        // Orca custom: dump the processed moves next to the source gcode file.
+        GCodeProcessor::export_moves_file(*result, file);
     } catch (std::exception & /* ex */) {
         BOOST_LOG_TRIVIAL(error) << __FUNCTION__ <<  boost::format(": found errors when process gcode file %1%") %file.c_str();
         throw Slic3r::RuntimeError(

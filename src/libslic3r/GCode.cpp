@@ -2136,6 +2136,8 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
     m_processor.finalize(true);
 //    DoExport::update_print_estimated_times_stats(m_processor, print->m_print_statistics);
     DoExport::update_print_estimated_stats(m_processor, m_writer.extruders(), print->m_print_statistics, print->config());
+    // Orca custom: always dump the processed moves next to the exported gcode.
+    GCodeProcessor::export_moves_file(m_processor.get_result(), path);
     if (result != nullptr) {
         *result = std::move(m_processor.extract_result());
         // set the filename to the correct value

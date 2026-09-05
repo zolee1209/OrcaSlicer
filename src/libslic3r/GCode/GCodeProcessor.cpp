@@ -5991,4 +5991,91 @@ int GCodeProcessor::get_extruder_id(bool force_initialize)const
     return static_cast<int>(m_extruder_id);
 }
 
+// Orca custom: binary sidecar format "OSMV" v1 (little-endian):
+//   magic[4]="OSMV", u32 version, u32 extrude_type_id, u32 role_count,
+//   u32 color_count, u64 move_count,
+//   role_count * (u16 len + utf8 name),          role id == table index
+//   color_count * (u16 len + utf8 "#RRGGBB"),    filament/extruder colors
+//   move_count * 24B record: u8 type, u8 role, u8 extruder_id, u8 pad,
+//                            f32 x, y, z, width, height
+void GCodeProcessor::export_moves_file(const GCodeProcessorResult& result, const std::string& gcode_path)
+{
+    const std::string out_path = gcode_path + ".moves";
+    FILE* f = boost::nowide::fopen(out_path.c_str(), "wb");
+    if (f == nullptr) {
+        BOOST_LOG_TRIVIAL(warning) << "export_moves_file: cannot open " << out_path << " for writing";
+        return;
+    }
+
+    const char     magic[4]     = { 'O', 'S', 'M', 'V' };
+    const uint32_t version      = 1;
+    const uint32_t extrude_type = static_cast<uint32_t>(EMoveType::Extrude);
+    const uint32_t role_count   = static_cast<uint32_t>(erCount);
+    const uint32_t color_count  = static_cast<uint32_t>(result.extruder_colors.size());
+    const uint64_t move_count   = static_cast<uint64_t>(result.moves.size());
+
+    bool ok = true;
+    ok &= fwrite(magic, 1, 4, f) == 4;
+    ok &= fwrite(&version, sizeof(version), 1, f) == 1;
+    ok &= fwrite(&extrude_type, sizeof(extrude_type), 1, f) == 1;
+    ok &= fwrite(&role_count, sizeof(role_count), 1, f) == 1;
+    ok &= fwrite(&color_count, sizeof(color_count), 1, f) == 1;
+    ok &= fwrite(&move_count, sizeof(move_count), 1, f) == 1;
+
+    auto write_string = [&](const std::string& s) {
+        const uint16_t len = static_cast<uint16_t>(std::min<size_t>(s.size(), 0xffff));
+        ok &= fwrite(&len, sizeof(len), 1, f) == 1;
+        if (len > 0)
+            ok &= fwrite(s.data(), 1, len, f) == len;
+    };
+
+    for (uint32_t i = 0; i < role_count; ++i)
+        write_string(ExtrusionEntity::role_to_string(static_cast<ExtrusionRole>(i)));
+    for (const std::string& color : result.extruder_colors)
+        write_string(color);
+
+#pragma pack(push, 1)
+    struct Record
+    {
+        uint8_t type;
+        uint8_t role;
+        uint8_t extruder_id;
+        uint8_t pad;
+        float   x, y, z, width, height;
+    };
+#pragma pack(pop)
+    static_assert(sizeof(Record) == 24, "unexpected .moves record size");
+
+    std::vector<Record> buf;
+    const size_t chunk = 65536;
+    buf.reserve(std::min<size_t>(result.moves.size(), chunk));
+    for (const GCodeProcessorResult::MoveVertex& m : result.moves) {
+        Record r;
+        r.type        = static_cast<uint8_t>(m.type);
+        r.role        = static_cast<uint8_t>(m.extrusion_role);
+        r.extruder_id = m.extruder_id;
+        r.pad         = 0;
+        r.x           = m.position.x();
+        r.y           = m.position.y();
+        r.z           = m.position.z();
+        r.width       = m.width;
+        r.height      = m.height;
+        buf.emplace_back(r);
+        if (buf.size() == chunk) {
+            ok &= fwrite(buf.data(), sizeof(Record), buf.size(), f) == buf.size();
+            buf.clear();
+        }
+    }
+    if (!buf.empty())
+        ok &= fwrite(buf.data(), sizeof(Record), buf.size(), f) == buf.size();
+
+    fclose(f);
+    if (!ok) {
+        BOOST_LOG_TRIVIAL(warning) << "export_moves_file: failed writing " << out_path;
+        boost::nowide::remove(out_path.c_str());
+    } else {
+        BOOST_LOG_TRIVIAL(info) << "export_moves_file: exported " << move_count << " moves to " << out_path;
+    }
+}
+
 } /* namespace Slic3r */

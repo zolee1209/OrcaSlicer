@@ -322,6 +322,8 @@ public:
     // BBS
     Vec2d get_size() const { return Vec2d(m_width, m_depth); }
     ModelObjectPtrs get_objects() { return m_model->objects; }
+    // Update the model pointer (needed after m_models reallocation, e.g. after --assemble)
+    void set_model(Model* model) { m_model = model; }
     ModelObjectPtrs get_objects_on_this_plate();
     ModelInstance* get_instance(int obj_id, int instance_id);
     BoundingBoxf3 get_objects_bounding_box();
@@ -686,6 +688,13 @@ public:
     PartPlateList(int width, int depth, int height, Plater* platerObj, Model* modelObj, PrinterTechnology tech = ptFFF);
     PartPlateList(Plater* platerObj, Model* modelObj, PrinterTechnology tech = ptFFF);
     ~PartPlateList();
+
+    // Update the model pointer for all plates (needed after m_models reallocation, e.g. --assemble)
+    void set_model(Model* model) {
+        m_model = model;
+        for (PartPlate* plate : m_plate_list)
+            plate->set_model(model);
+    }
 
     //this may be happened after machine changed
     void reset_size(int width, int depth, int height, bool reload_objects = true, bool update_shapes = false);

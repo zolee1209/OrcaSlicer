@@ -7,9 +7,12 @@ else()
 endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    set(_glfw_use_wayland "-DGLFW_USE_WAYLAND=ON")
+    # Use X11 backend so CLI thumbnail rendering works on X11 sessions without
+    # a Wayland compositor.  Wayland-only builds cause glfwInit() to fail when
+    # WAYLAND_DISPLAY is not set (headless / X11-only environments).
+    set(_glfw_use_wayland "-DGLFW_USE_WAYLAND=OFF")
 else()
-    set(_glfw_use_wayland "-DGLFW_USE_WAYLAND=FF")
+    set(_glfw_use_wayland "-DGLFW_USE_WAYLAND=OFF")
 endif()
 
 orcaslicer_add_cmake_project(GLFW

@@ -10314,6 +10314,23 @@ CLIMiscConfigDef::CLIMiscConfigDef()
     def->cli_params = "\"#RRGGBB;#RRGGBB;...\"";
     def->set_default_value(new ConfigOptionStrings{ "#DBDBDB" });
 
+    def = this->add("flushing_multiplier", coFloat);
+    def->label = L("Flushing multiplier");
+    def->tooltip = L("Scales the computed flush volumes for all filament transitions by this factor. "
+                     "Range: 0.0 – 3.0 (same as the GUI slider). "
+                     "Defaults to: 1.0 (no scaling).");
+    def->cli_params = "1.0";
+    def->set_default_value(new ConfigOptionFloat(1.0));
+
+    def = this->add("object_distance", coFloat);
+    def->label = L("Object distance");
+    def->tooltip = L("Minimum distance (mm) between objects when auto-arranging. "
+                     "Set to 0 to use the value determined automatically from the print settings "
+                     "(extruder clearance radius / brim). "
+                     "Defaults to: 0 (auto).");
+    def->cli_params = "0.0";
+    def->set_default_value(new ConfigOptionFloat(0.0));
+
     def = this->add("allow_multicolor_oneplate", coBool);
     def->label = L("Allow multiple colors on one plate");
     def->tooltip = L("If enabled, Arrange will allow multiple colors on one plate.");
