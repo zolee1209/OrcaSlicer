@@ -456,8 +456,13 @@ void GLModel::init_from(const indexed_triangle_set& its)
     data.reserve_vertices(3 * its.indices.size());
     data.reserve_indices(3 * its.indices.size());
 
-    // Read user preference: smooth normals enabled
-    const bool smooth_normals_enabled = wxGetApp().app_config != nullptr && wxGetApp().app_config->get_bool(SETTING_OPENGL_PHONG_SMOOTH_NORMALS);
+    // Read user preference: smooth normals enabled.
+    // ORCA: wxApp::GetInstance() is null in CLI mode (no GUI_App is ever constructed),
+    // and wxGetApp() dereferences that pointer unconditionally, so guard the call the
+    // same way GLModel::render() already does, instead of crashing on the first mesh
+    // loaded for a headless CLI thumbnail render.
+    const bool smooth_normals_enabled = wxApp::GetInstance() != nullptr
+        && wxGetApp().app_config != nullptr && wxGetApp().app_config->get_bool(SETTING_OPENGL_PHONG_SMOOTH_NORMALS);
 
     if (smooth_normals_enabled) {
         // Use per-corner smooth normals (via IGL)
