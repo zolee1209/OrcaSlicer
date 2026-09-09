@@ -1491,6 +1491,16 @@ int CLI::run(int argc, char **argv)
     if (downward_check_option)
         downward_check = downward_check_option->value;
 
+    // ORCA: --parallel, chunked multi-threaded per-layer g-code text generation (fast, approximate
+    // slice). Read before the start_gui decision below and pushed onto Print's process-wide default,
+    // so it also takes effect if the GUI ends up starting (e.g. run from a terminal with --parallel
+    // present but no --slice action) and not just for the CLI slicing loop further down.
+    bool parallel_export = false;
+    ConfigOptionBool* parallel_export_option = m_config.option<ConfigOptionBool>("parallel");
+    if (parallel_export_option)
+        parallel_export = parallel_export_option->value;
+    Print::set_default_parallel_gcode_export(parallel_export);
+
     bool start_gui = m_actions.empty() && !downward_check;
     if (start_gui) {
         BOOST_LOG_TRIVIAL(info) << "no action, start gui directly" << std::endl;
@@ -5986,8 +5996,6 @@ int CLI::run(int argc, char **argv)
 
     // Initialise OpenGL early so that export_gcode can embed gcode thumbnails.
     {
-        int gl_major, gl_minor, gl_verbos;
-        glfwGetVersion(&gl_major, &gl_minor, &gl_verbos);
         // On Linux, GLFW built with Wayland support will attempt to connect to a
         // Wayland compositor even when WAYLAND_DISPLAY is empty, by probing
         // $XDG_RUNTIME_DIR/wayland-0 directly.  This causes glfwInit() to fail on
@@ -6022,14 +6030,25 @@ int CLI::run(int argc, char **argv)
                 << " msg=" << (glfw_err_msg ? glfw_err_msg : "none")
                 << ") – gcode thumbnails will be skipped";
         } else {
-            glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, gl_major);
-            glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, gl_minor);
             glfwWindowHint(GLFW_RED_BITS,   8);
             glfwWindowHint(GLFW_GREEN_BITS, 8);
             glfwWindowHint(GLFW_BLUE_BITS,  8);
             glfwWindowHint(GLFW_ALPHA_BITS, 8);
             glfwWindowHint(GLFW_VISIBLE, false);
+            // ORCA: GLFW only honours GLFW_OPENGL_PROFILE (core or compat) when an
+            // explicit context version >= 3.2 is also requested ("Context profiles
+            // are only defined for OpenGL version 3.2 and above", GLFW_INVALID_VALUE
+            // otherwise). The version used to be (mis-)populated from
+            // glfwGetVersion() – the GLFW *library* version (e.g. 3.4) – which is
+            // not a valid OpenGL version (there is no "OpenGL 3.4"), so the driver
+            // rejected the context and glfwCreateWindow() always returned NULL,
+            // silently disabling CLI thumbnail generation. Use 3.2 (the lowest
+            // version PartPlate/3DScene actually support, see OpenGLVersions::core
+            // in GUI_Init.cpp) for both profiles instead.
+            glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+            glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 2);
 #ifdef __WXMAC__
+            // macOS only ever provides Core-profile contexts.
             glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
             glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
 #else
@@ -6037,7 +6056,11 @@ int CLI::run(int argc, char **argv)
 #endif
             thumb_ctx.window = glfwCreateWindow(640, 480, "base_window", NULL, NULL);
             if (thumb_ctx.window == NULL) {
-                BOOST_LOG_TRIVIAL(warning) << "Failed to create GLFW window – gcode thumbnails will be skipped";
+                const char* glfw_err_msg = nullptr;
+                int glfw_err_code = glfwGetError(&glfw_err_msg);
+                BOOST_LOG_TRIVIAL(warning) << "Failed to create GLFW window (code=" << glfw_err_code
+                    << " msg=" << (glfw_err_msg ? glfw_err_msg : "none")
+                    << ") – gcode thumbnails will be skipped";
             } else {
                 glfwMakeContextCurrent(thumb_ctx.window);
                 if (thumb_ctx.opengl_mgr.init_gl(false)) {
@@ -6297,6 +6320,9 @@ int CLI::run(int argc, char **argv)
                         part_plate->get_print(&print, &gcode_result, &print_index);
 
                         print_fff = dynamic_cast<Print *>(print);
+                        // ORCA: --parallel, chunked multi-threaded g-code text generation.
+                        if (print_fff)
+                            print_fff->set_parallel_gcode_export(parallel_export);
                         /*if (outfile_config.empty())
                         {
                             outfile = "plate_" + std::to_string(index + 1) + ".gcode";

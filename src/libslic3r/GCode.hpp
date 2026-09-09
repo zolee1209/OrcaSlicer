@@ -114,6 +114,10 @@ public:
 
     std::string prime(GCode &gcodegen);
     void next_layer() { ++ m_layer_idx; m_tool_change_idx = 0; }
+    // ORCA parallel export: seed the cursor for a worker that resumes mid-print at a known
+    // wipe-tower-active-layer index (one less than the chunk's first such layer, so the next
+    // next_layer() call lands exactly on it), instead of replaying every earlier layer.
+    void set_layer_idx(int idx) { m_layer_idx = idx; m_tool_change_idx = 0; }
     std::string tool_change(GCode &gcodegen, int extruder_id, bool finish_layer);
     bool is_empty_wipe_tower_gcode(GCode &gcodegen, int extruder_id, bool finish_layer);
     std::string finalize(GCode &gcodegen);
@@ -222,6 +226,12 @@ public:
     // throws CanceledException through print->throw_if_canceled().
     void            do_export(Print* print, const char* path, GCodeProcessorResult* result = nullptr, ThumbnailsGeneratorCallback thumbnail_cb = nullptr);
     void            export_layer_filaments(GCodeProcessorResult* result);
+    // ORCA: activated by the CLI --parallel flag (Print::parallel_gcode_export()). When set,
+    // do_export() splits the (already fully sliced) per-layer text generation across several
+    // independently-seeded worker threads instead of a single serial pass. See
+    // docs/PARALLEL_GCODE_FEASIBILITY.md in the www workspace for the design rationale.
+    void            set_parallel_export(bool enable) { m_parallel_export_requested = enable; }
+    bool            parallel_export_requested() const { return m_parallel_export_requested; }
     //BBS: set offset for gcode writer
     void set_gcode_offset(double x, double y) { m_writer.set_xy_offset(x, y); m_processor.set_xy_offset(x, y);}
 
@@ -395,6 +405,46 @@ private:
         const std::vector<const PrintInstance*>                             &print_object_instances_ordering,
         const std::vector<std::pair<coordf_t, std::vector<LayerToPrint>>>   &layers_to_print,
         GCodeOutputStream                                                   &output_stream);
+    // ORCA parallel export: same contract as process_layers() above, but splits layers_to_print
+    // into contiguous chunks generated concurrently by independent GCode workers (chunk 0 reuses
+    // *this, already fully set up by the preamble; later chunks get a lightweight, freshly-seeded
+    // clone). Falls back to the serial process_layers() when there is nothing useful to split.
+    void process_layers_parallel(
+        const Print                                                         &print,
+        const ToolOrdering                                                  &tool_ordering,
+        const std::vector<const PrintInstance*>                             &print_object_instances_ordering,
+        const std::vector<std::pair<coordf_t, std::vector<LayerToPrint>>>   &layers_to_print,
+        GCodeOutputStream                                                   &output_stream);
+    // ORCA parallel export: a snapshot of the handful of *this fields that clone_for_parallel_chunk()
+    // needs to read, captured once (serially) right before the chunk workers start running
+    // concurrently. Avoids a data race against chunk 0 (which reuses *this and keeps mutating some
+    // of these same fields, e.g. m_placeholder_parser_integration.parser on tool changes) while the
+    // other chunks' clones are being constructed on their own worker threads.
+    struct ParallelChunkSharedState {
+        PlaceholderParser    parser;
+        DynamicConfig        calib_config;
+        Vec2d                origin;
+        bool                 enable_cooling_markers;
+        bool                 enable_exclude_object;
+        std::vector<size_t>  label_objects_ids;
+        bool                 silent_time_estimator_enabled;
+        unsigned int         layer_count;
+    };
+    // Builds an independent GCode worker that resumes mid-print at a chunk's first layer, for
+    // process_layers_parallel(). Redoes only the cheap, per-worker setup (config, extruders,
+    // cooling buffer, wipe tower cursor, ...); the expensive one-time SeamPlacer analysis is
+    // redone per worker too (simpler and safer than sharing mutable state across threads), but
+    // since it runs concurrently with the other workers' own layer generation it does not
+    // reintroduce a serial bottleneck.
+    std::unique_ptr<GCode> clone_for_parallel_chunk(
+        Print                          &print,
+        const ToolOrdering             &tool_ordering,
+        const ParallelChunkSharedState &shared,
+        bool                            has_wipe_tower_for_print,
+        int                             wipe_tower_layer_idx_seed,
+        unsigned int                    seed_extruder_id,
+        float                           last_layer_z_before_chunk,
+        int                             layer_index_seed) const;
     // Process all layers of a single object instance (sequential mode) with a parallel pipeline:
     // Generate G-code, run the filters (vase mode, cooling buffer), run the G-code analyser
     // and export G-code into file.
@@ -540,7 +590,14 @@ private:
 
     std::set<ObjectInstanceID>      m_objsWithBrim; // indicates the object instances with brim
     // Cache for custom seam enforcers/blockers for each layer.
-    SeamPlacer                          m_seam_placer;
+    // ORCA: shared_ptr (not by value) so parallel-export clones can share *this's already-computed
+    // instance (see clone_for_parallel_chunk()) instead of each re-running SeamPlacer::init() --
+    // that call is expensive and, being internally tbb-parallel itself, isn't provably
+    // reproducible when invoked repeatedly within the same process (each clone's independent
+    // invocation could schedule slightly differently), so sharing one result is both faster and
+    // deterministic. place_seam() is const and read-only, safe to call concurrently from multiple
+    // chunk workers on the shared instance.
+    std::shared_ptr<SeamPlacer>         m_seam_placer = std::make_shared<SeamPlacer>();
 
     // One stop of the island-level tour: consecutive islands of a single instance. An instance
     // can have several visits per layer when its islands are toured non-consecutively.
@@ -657,6 +714,8 @@ private:
     // of the G-code lines: _EXTRUDE_SET_SPEED, _WIPE, _OVERHANG_FAN_START, _OVERHANG_FAN_END
     // Those comments are received and consumed (removed from the G-code) by the CoolingBuffer.pm Perl module.
     bool                                m_enable_cooling_markers;
+    // ORCA: set via set_parallel_export()/Print::parallel_gcode_export() (the CLI --parallel flag).
+    bool                                m_parallel_export_requested { false };
     
     bool m_enable_exclude_object;
     std::vector<size_t> m_label_objects_ids;

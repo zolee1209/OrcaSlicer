@@ -55,6 +55,8 @@ using namespace nlohmann;
 namespace Slic3r {
 
 Print::SlicingPipelineHookFn Print::s_slicing_pipeline_hook_fn = nullptr;
+// ORCA: see Print::set_default_parallel_gcode_export() in Print.hpp.
+bool Print::s_default_parallel_gcode_export = false;
 
 template class PrintState<PrintStep, psCount>;
 template class PrintState<PrintObjectStep, posCount>;
@@ -2924,6 +2926,8 @@ std::string Print::export_gcode(const std::string& path_template, GCodeProcessor
     //BBS: compute plate offset for gcode-generator
     const Vec3d origin = this->get_plate_origin();
     gcode.set_gcode_offset(origin(0), origin(1));
+    // ORCA: --parallel CLI flag: chunked, multi-threaded per-layer text generation.
+    gcode.set_parallel_export(m_parallel_gcode_export);
     gcode.do_export(this, path.c_str(), result, thumbnail_cb);
     gcode.export_layer_filaments(result);
     //BBS
@@ -5177,7 +5181,10 @@ int Print::export_cached_data(const std::string& directory, bool with_space)
         fs::remove_all(directory_path);
     }
     try {
-        if (!fs::create_directory(directory_path)) {
+        // ORCA: create_directories (not create_directory) so that a not-yet-existing
+        // parent chain (e.g. a caller-managed cache-key subdirectory) is created too,
+        // instead of silently failing when only the leaf directory is missing.
+        if (!fs::create_directories(directory_path)) {
             BOOST_LOG_TRIVIAL(error) << boost::format("create directory %1% failed")%directory;
             return CLI_EXPORT_CACHE_DIRECTORY_CREATE_FAILED;
         }
