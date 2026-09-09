@@ -629,28 +629,58 @@ static ExPolygons outer_inner_brim_area(const Print& print,
         expolygons_append(no_brim_area, expolyFromLines);
     }
 
+    // ORCA: precompute a bounding box per instance's brim area, and per fragment of the global
+    // no_brim_area, once - used below (and in the "contact" pass further down) as a cheap
+    // broad-phase filter so we don't run an expensive Clipper diff/intersection of this
+    // instance's brim against every OTHER instance's geometry on the plate. On a normal,
+    // well-spaced multi-object plate almost none of that geometry is actually reachable.
+    std::map<ObjectInstanceID, BoundingBox> instance_bboxes;
+    for (const auto& [key, areas] : brimAreaMap)
+        instance_bboxes.emplace(key, get_extents(areas));
+    std::vector<BoundingBox> no_brim_area_bboxes;
+    no_brim_area_bboxes.reserve(no_brim_area.size());
+    for (const ExPolygon& ex : no_brim_area)
+        no_brim_area_bboxes.emplace_back(get_extents(ex));
+
     for (const PrintObject* object : print.objects()) {
-        ExPolygons extruder_no_brim_area = no_brim_area;
-        auto iter = std::find_if(objPrintVec.begin(), objPrintVec.end(), [object](const std::pair<ObjectID, unsigned int>& item) {
-            return item.first == object->id();
-        });
+        for (auto& [key, areas] : brimAreaMap) {
+            if (key.object_id != object->id())
+                continue;
+            auto bbox_it = instance_bboxes.find(key);
+            const bool have_bbox = bbox_it != instance_bboxes.end() && bbox_it->second.defined;
 
-        if (iter != objPrintVec.end()) {
-            int extruder_id = filament_map[iter->second - 1] - 1;
-            auto bedPoly = extruder_unprintable_area[extruder_id];
-            auto bedExPoly   = diff_ex((offset(bedPoly, scale_(30.), jtRound, SCALED_RESOLUTION)), {bedPoly});
-            if (!bedExPoly.empty()) {
-                extruder_no_brim_area.push_back(bedExPoly.front());
+            ExPolygons extruder_no_brim_area;
+            for (size_t i = 0; i < no_brim_area.size(); ++i)
+                if (!have_bbox || no_brim_area_bboxes[i].overlap(bbox_it->second))
+                    extruder_no_brim_area.push_back(no_brim_area[i]);
+
+            auto iter = std::find_if(objPrintVec.begin(), objPrintVec.end(), [object](const std::pair<ObjectID, unsigned int>& item) {
+                return item.first == object->id();
+            });
+
+            if (iter != objPrintVec.end()) {
+                int extruder_id = filament_map[iter->second - 1] - 1;
+                auto bedPoly = extruder_unprintable_area[extruder_id];
+                auto bedExPoly   = diff_ex((offset(bedPoly, scale_(30.), jtRound, SCALED_RESOLUTION)), {bedPoly});
+                if (!bedExPoly.empty()) {
+                    extruder_no_brim_area.push_back(bedExPoly.front());
+                }
+                //extruder_no_brim_area = offset2_ex(extruder_no_brim_area, scaled_flow_width, -scaled_flow_width); // connect scattered small areas to prevent generating very small brims
+
             }
-            //extruder_no_brim_area = offset2_ex(extruder_no_brim_area, scaled_flow_width, -scaled_flow_width); // connect scattered small areas to prevent generating very small brims
 
+            areas = diff_ex(areas, extruder_no_brim_area);
         }
-
-        for (auto& [key, areas] : brimAreaMap)
-            if (key.object_id == object->id())
-                areas = diff_ex(areas, extruder_no_brim_area);
-
     }
+
+    // ORCA: on a multi-object plate this "does this fragment touch something" check used to
+    // rebuild `otherExPolys` (the concatenation of every OTHER instance's brim area) from
+    // scratch for every single instance - an O(n^2) copy+union cost that dominates slicing
+    // time once there are more than a few dozen instances, even though well-spaced instances
+    // (the normal arrange result) are never actually close enough to touch each other's brim.
+    // Reuse the per-instance bboxes precomputed above and only pull in other instances whose
+    // (inflated) bbox can plausibly overlap this one, instead of every other instance.
+    const coord_t contact_dist = print.brim_flow().scaled_spacing() * 2;
 
     brim_area.clear();
     for (const PrintObject* object : print.objects()) {
@@ -659,14 +689,22 @@ static ExPolygons outer_inner_brim_area(const Print& print,
             if (map_it->first.object_id != object->id())
                 continue;
 
-            // find other objects' brim area
-            ExPolygons otherExPolys;
-            for (const auto& [other_key, other_areas] : brimAreaMap)
-                if (other_key != map_it->first)
-                    expolygons_append(otherExPolys, other_areas);
-
             auto tempArea = map_it->second;
             map_it->second.clear();
+            if (tempArea.empty())
+                continue;
+
+            // find other objects' brim area that could plausibly be near this one
+            ExPolygons otherExPolys;
+            BoundingBox this_bbox = instance_bboxes.at(map_it->first);
+            this_bbox.offset(contact_dist);
+            for (const auto& [other_key, other_areas] : brimAreaMap) {
+                if (other_key == map_it->first)
+                    continue;
+                auto bbox_it = instance_bboxes.find(other_key);
+                if (bbox_it != instance_bboxes.end() && bbox_it->second.defined && this_bbox.overlap(bbox_it->second))
+                    expolygons_append(otherExPolys, other_areas);
+            }
 
             for (int ia = 0; ia != tempArea.size(); ++ia) {
                 // find this object's other brim area
