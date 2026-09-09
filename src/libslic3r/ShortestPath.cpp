@@ -1162,13 +1162,25 @@ std::vector<size_t> chain_points(const Points &points, const Point *start_near)
 std::vector<size_t> chain_points_with_postprocessing(const Points &points, const Point *start_near)
 {
 	std::vector<size_t> path = chain_points(points, start_near);
-	// Alternate 2-opt and crossing removal until convergence.
-	// 2-opt can create new crossings, and crossing removal can create new
-	// opportunities for 2-opt improvement. Break early if neither improves.
-	for (int iter = 0; iter < 3; ++iter) {
-		bool improved = tsp_2opt_improve(path, points);
-		improved |= tsp_remove_crossings(path, points);
-		if (!improved) break;
+	// ORCA: tsp_remove_crossings is up to O(n^4) worst case (its iteration cap is n^2, each
+	// iteration re-scanning all O(n^2) edge pairs) and tsp_2opt_improve is O(n^2) per pass.
+	// This is a non-issue for the handful of objects a plate normally has, but "island-level"
+	// ordering (see order_points_with_strategy callers) invokes this per-layer with one point
+	// per printable island - a busy multi-object plate with a complex per-layer silhouette can
+	// easily reach hundreds of points per layer, at which point the O(n^4) term turns a single
+	// layer into a multi-second-to-minutes stall, repeated for every layer of the print. Skip
+	// the refinement above a safe point count and keep the cheap greedy nearest-neighbor tour -
+	// still a valid, reasonable ordering, just not locally 2-opt/crossing-optimal.
+	constexpr size_t kMaxPostprocessingPoints = 200;
+	if (points.size() <= kMaxPostprocessingPoints) {
+		// Alternate 2-opt and crossing removal until convergence.
+		// 2-opt can create new crossings, and crossing removal can create new
+		// opportunities for 2-opt improvement. Break early if neither improves.
+		for (int iter = 0; iter < 3; ++iter) {
+			bool improved = tsp_2opt_improve(path, points);
+			improved |= tsp_remove_crossings(path, points);
+			if (!improved) break;
+		}
 	}
     if (start_near == nullptr)
         tsp_rotate_minimize_closing(path, points);
