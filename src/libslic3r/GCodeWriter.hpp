@@ -81,6 +81,11 @@ public:
     bool        need_toolchange(unsigned int filament_id) const;
     std::string set_extruder(unsigned int filament_id);
     void init_extruder(unsigned int filament_id);
+    // ORCA parallel export: force the "currently active tool" bookkeeping to filament_id without
+    // emitting any tool-change g-code. Used to resynchronize the primary export object's writer
+    // (used for chunk 0) with the true last tool used, after chunked parallel export finished on
+    // separate worker threads, so trailing code (e.g. machine_end_gcode) sees the right context.
+    void reseat_current_extruder(unsigned int filament_id) { m_curr_extruder_id = -1; init_extruder(filament_id); }
     // Current parked-retract length of a filament's extruder (share-aware). Used for the
     // new_extruder_retracted_length change-filament placeholder. Returns 0 if the filament is unknown.
     double get_extruder_retracted_length(const int filament_id);

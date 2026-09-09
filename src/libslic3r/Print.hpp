@@ -1350,6 +1350,17 @@ public:
     void set_check_multi_filaments_compatibility(bool check) { m_need_check_multi_filaments_compatibility = check; }
     bool need_check_multi_filaments_compatibility() const { return m_need_check_multi_filaments_compatibility; }
 
+    // ORCA: activated by the CLI --parallel flag. Tells GCode::do_export to use a chunked,
+    // multi-threaded per-layer text generation pipeline for a fast, approximate slice (quick
+    // time/filament estimation). Not intended to produce a physically-optimal production g-code.
+    void set_parallel_gcode_export(bool enable) { m_parallel_gcode_export = enable; }
+    bool parallel_gcode_export() const { return m_parallel_gcode_export; }
+    // Process-wide default, applied to every Print as it is constructed (NSDMI below). Set once
+    // from CLI::run() before Slic3r::GUI::GUI_Run()/any Print exists, so a GUI launched from a
+    // terminal with --parallel present picks it up too, without threading the flag through
+    // GUI_InitParams/Plater/BackgroundSlicingProcess.
+    static void set_default_parallel_gcode_export(bool enable) { s_default_parallel_gcode_export = enable; }
+
     // scaled point
     Vec2d translate_to_print_space(const Point &point) const;
     static FilamentTempType get_filament_temp_type(const std::string& filament_type);
@@ -1479,6 +1490,9 @@ private:
 
     static SlicingPipelineHookFn s_slicing_pipeline_hook_fn;
     bool m_pipeline_plugin_active { false };
+    // ORCA: backing storage for parallel_gcode_export()/set_parallel_gcode_export().
+    static bool s_default_parallel_gcode_export;
+    bool m_parallel_gcode_export { s_default_parallel_gcode_export };
     void run_pipeline_hook(SlicingPipelineStepPlugin step, const PrintObject* object) {
         if (m_pipeline_plugin_active && s_slicing_pipeline_hook_fn)
             s_slicing_pipeline_hook_fn(*this, object, step);

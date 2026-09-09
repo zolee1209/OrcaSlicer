@@ -59,6 +59,7 @@
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/filesystem/operations.hpp>
 #include <boost/filesystem/path.hpp>
+#include <atomic>
 #include <cfloat>
 #include <climits>
 #include <cmath>
@@ -86,6 +87,7 @@
 #include <system_error>
 #include <unordered_set>
 #include <type_traits>
+#include <thread>
 #include <utility>
 #include <string_view>
 #include <sstream>
@@ -4339,11 +4341,11 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
 
     // Collect custom seam data from all objects.
     std::function<void(void)> throw_if_canceled_func = [&print]() { print.throw_if_canceled(); };
-    m_seam_placer.init(print, throw_if_canceled_func);
+    m_seam_placer->init(print, throw_if_canceled_func);
     // Precise Seam: init() only prepares its warning; issue it here, inside the active export step.
-    if (!m_seam_placer.precise_seam_warning().empty())
+    if (!m_seam_placer->precise_seam_warning().empty())
         print.active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL,
-                                      m_seam_placer.precise_seam_warning(),
+                                      m_seam_placer->precise_seam_warning(),
                                       PrintStateBase::SlicingPreciseSeamWarning);
 
     // BBS: get path for change filament
@@ -4625,7 +4627,19 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
             // Process all layers of all objects (non-sequential mode) with a parallel pipeline:
             // Generate G-code, run the filters (vase mode, cooling buffer), run the G-code analyser
             // and export G-code into file.
-            this->process_layers(print, tool_ordering, print_object_instances_ordering, layers_to_print, file);
+            // ORCA: --parallel (see Print::parallel_gcode_export()) additionally splits the
+            // per-layer text-generation itself across chunks/threads; only safe/wired up for the
+            // plain non-sequential path with no calibration tower (m_calib_config is mutated
+            // per-layer for calibration modes, which chunk 0 and the clones must not race on), so
+            // every other mode keeps the normal serial pipeline.
+            const bool use_parallel_chunked_export = m_parallel_export_requested
+                && print.config().print_sequence != PrintSequence::ByObject
+                && print.calib_mode() == CalibMode::Calib_None
+                && !m_spiral_vase && !m_pressure_equalizer;
+            if (use_parallel_chunked_export)
+                this->process_layers_parallel(print, tool_ordering, print_object_instances_ordering, layers_to_print, file);
+            else
+                this->process_layers(print, tool_ordering, print_object_instances_ordering, layers_to_print, file);
             {
                 //save the flush statitics stored in tool ordering
                 print.m_statistics_by_extruder_count.stats_by_single_extruder = tool_ordering.get_filament_change_stats(ToolOrdering::FilamentChangeMode::SingleExt);
@@ -5173,6 +5187,249 @@ void GCode::process_layers(
     	tbb::parallel_pipeline(12, source & generator & cooling & fan_mover & pa_processor_filter & output);
     // The estimator's precomputed data points into this print's layers.
     m_extrusion_quality_estimator.set_precomputed_layers({});
+}
+
+// ORCA: builds an independent GCode worker that resumes mid-print at the first layer of a
+// parallel-export chunk. See docs/PARALLEL_GCODE_FEASIBILITY.md (www workspace) for the design.
+//
+// Only the state that actually affects the *text* produced for the chunk's own layers is
+// re-seeded here:
+//  - config / extruders / current tool: rebuilt through the normal public setters (never memcpy'd,
+//    since GCodeWriter's per-filament pointer cache would otherwise dangle - see
+//    GCodeWriter::set_extruders()/init_extruder()).
+//  - the fully-populated custom-gcode placeholder variable set: copied by value from *this (cheap,
+//    PlaceholderParser is a plain value type), so {layer_num}/{current_filament_id}/etc. still work.
+//  - cooling buffer / adaptive-PA / wipe tower integration: reconstructed exactly as the real
+//    preamble does, with the wipe tower cursor seeded to the chunk's own starting layer.
+//  - "have we already done this once" one-shot flags (m_second_layer_things_done, m_brim_done):
+//    forced true, since this clone is never actually processing the object's true first layer.
+// Deliberately left at default/neutral values (documented as acceptable at chunk boundaries):
+// m_last_pos/m_last_pos_defined (forces a safe travel), m_wipe/m_avoid_crossing_perimeters (lose a
+// travel-routing optimization only), m_last_layer_accumulated_mass (a placeholder-var only).
+std::unique_ptr<GCode> GCode::clone_for_parallel_chunk(
+    Print                          &print,
+    const ToolOrdering             &tool_ordering,
+    const ParallelChunkSharedState &shared,
+    bool                            has_wipe_tower_for_print,
+    int                             wipe_tower_layer_idx_seed,
+    unsigned int                    seed_extruder_id,
+    float                           last_layer_z_before_chunk,
+    int                             layer_index_seed) const
+{
+    auto clone = std::make_unique<GCode>();
+    clone->m_print      = this->m_print;
+    clone->m_curr_print = this->m_curr_print;
+
+    clone->apply_print_config(print.config());
+    clone->m_config.apply(print.default_object_config());
+    clone->m_config.apply(print.default_region_config());
+    clone->m_calib_config = shared.calib_config;
+    clone->m_origin       = shared.origin;
+
+    clone->set_extruders(tool_ordering.all_extruders());
+    clone->m_writer.init_extruder(seed_extruder_id);
+
+    // Inherit the already fully-populated custom-gcode placeholder variable set from the real
+    // preamble (captured once, before any chunk started), so per-layer templates keep working.
+    clone->m_placeholder_parser_integration.parser = shared.parser;
+    clone->m_placeholder_parser_integration.init(clone->m_writer);
+
+    DoExport::init_ooze_prevention(print, clone->m_ooze_prevention);
+    // Share *this's already-computed SeamPlacer (see the m_seam_placer declaration in GCode.hpp)
+    // instead of re-running the expensive, internally tbb-parallel init() per clone.
+    clone->m_seam_placer = this->m_seam_placer;
+    clone->m_timelapse_pos_picker.init(&print, clone->m_writer.get_xy_offset().cast<coord_t>());
+
+    clone->m_enable_cooling_markers         = shared.enable_cooling_markers;
+    clone->m_enable_exclude_object          = shared.enable_exclude_object;
+    clone->m_label_objects_ids              = shared.label_objects_ids;
+    clone->m_silent_time_estimator_enabled  = shared.silent_time_estimator_enabled;
+    clone->m_layer_count                    = shared.layer_count;
+    clone->m_layer_index                    = layer_index_seed;
+    clone->m_last_layer_z                   = last_layer_z_before_chunk;
+    clone->m_max_layer_z                    = last_layer_z_before_chunk;
+    clone->m_need_change_layer_lift_z       = true;
+
+    // Mid-print continuation, not the object's real start: skip the one-shot 1st->2nd layer
+    // temperature/acceleration transition and brim generation.
+    clone->m_second_layer_things_done = true;
+    clone->m_brim_done                = true;
+
+    clone->m_cooling_buffer = make_unique<CoolingBuffer>(*clone);
+    clone->m_cooling_buffer->set_current_extruder(seed_extruder_id, clone->get_extruder_id(seed_extruder_id));
+
+    clone->m_pa_processor = std::make_unique<AdaptivePAProcessor>(*clone, tool_ordering.all_extruders());
+
+    if (clone->m_config.small_area_infill_flow_compensation.value && !clone->m_config.small_area_infill_flow_compensation_model.empty())
+        clone->m_small_area_infill_flow_compensator = make_unique<SmallAreaInfillFlowCompensator>(print.config());
+
+    if (has_wipe_tower_for_print) {
+        clone->m_wipe_tower.reset(new WipeTowerIntegration(print.config(), print.get_plate_index(), print.get_plate_origin(),
+            *print.wipe_tower_data().priming.get(), print.wipe_tower_data().tool_changes,
+            *print.wipe_tower_data().final_purge.get(), print.get_slice_used_filaments(false)));
+        clone->m_wipe_tower->set_wipe_tower_depth(print.get_wipe_tower_depth());
+        clone->m_wipe_tower->set_wipe_tower_bbx(print.get_wipe_tower_bbx());
+        clone->m_wipe_tower->set_rib_offset(print.get_rib_offset());
+        clone->m_wipe_tower->set_layer_idx(wipe_tower_layer_idx_seed);
+    }
+
+    return clone;
+}
+
+// ORCA: --parallel. Splits layers_to_print into contiguous chunks, generated concurrently by
+// independent GCode workers (chunk 0 reuses *this; later chunks use clone_for_parallel_chunk()),
+// then writes the resulting text to output_stream in the original layer order. Falls back to the
+// normal serial process_layers() whenever there isn't enough work to usefully split, or the
+// filters used here (cooling buffer + fan mover + adaptive PA) don't cover the active pipeline
+// (spiral vase / pressure equalizer are excluded by the caller).
+//
+// Trade-off (by design, see docs/PARALLEL_GCODE_FEASIBILITY.md): each internal chunk boundary may
+// contain a non-optimal extra travel move and/or an extra tool change, and per-layer placeholder
+// values that depend on true cumulative print state (e.g. curr_accumulated_mass) reset at chunk
+// starts. This g-code is intended for fast, approximate time/filament estimation, not printing.
+void GCode::process_layers_parallel(
+    const Print                                                         &print,
+    const ToolOrdering                                                  &tool_ordering,
+    const std::vector<const PrintInstance*>                             &print_object_instances_ordering,
+    const std::vector<std::pair<coordf_t, std::vector<LayerToPrint>>>   &layers_to_print,
+    GCodeOutputStream                                                   &output_stream)
+{
+    const size_t n_layers = layers_to_print.size();
+    // Skirt/brim only ever print on the very first few layers: keep chunk 0 large enough that no
+    // other chunk boundary can ever land inside that zone.
+    const size_t min_first_chunk_layers = std::max<size_t>(1, size_t(print.config().skirt_height.value) + 1);
+
+    const unsigned int hw_threads = std::max(1u, std::thread::hardware_concurrency());
+    // Clone construction is now cheap (SeamPlacer is shared, not recomputed per clone -- see
+    // clone_for_parallel_chunk()), so a small minimum layer count per chunk is enough to make
+    // splitting worthwhile; this matters most for prints with few layers but many objects/islands
+    // per layer, where per-layer g-code text generation can still dominate slicing time.
+    const size_t       n_chunks   = std::min<size_t>(hw_threads, std::max<size_t>(1, n_layers / 4));
+
+    if (n_chunks <= 1 || n_layers <= min_first_chunk_layers) {
+        // Not enough layers to usefully split: normal serial path.
+        this->process_layers(print, tool_ordering, print_object_instances_ordering, layers_to_print, output_stream);
+        return;
+    }
+
+    // Contiguous [begin, end) layer-index ranges, chunk 0 first (>= min_first_chunk_layers long).
+    std::vector<std::pair<size_t, size_t>> ranges;
+    ranges.emplace_back(size_t(0), min_first_chunk_layers);
+    {
+        const size_t remaining = n_layers - min_first_chunk_layers;
+        const size_t base      = remaining / n_chunks;
+        const size_t rem       = remaining % n_chunks;
+        size_t       pos       = min_first_chunk_layers;
+        for (size_t c = 0; c < n_chunks; ++c) {
+            const size_t begin = pos;
+            pos += base + (c < rem ? 1 : 0);
+            if (c + 1 == n_chunks)
+                pos = n_layers;
+            ranges.emplace_back(begin, pos);
+        }
+    }
+    ranges.erase(std::remove_if(ranges.begin(), ranges.end(),
+        [](const std::pair<size_t, size_t> &r) { return r.first >= r.second; }), ranges.end());
+    const size_t n_real_chunks = ranges.size();
+
+    // Prefix count of wipe-tower-active layers, so each chunk can seed its own WipeTowerIntegration
+    // cursor instead of replaying every earlier layer through next_layer().
+    std::vector<int> wipe_tower_prefix(n_layers + 1, 0);
+    for (size_t i = 0; i < n_layers; ++i)
+        wipe_tower_prefix[i + 1] = wipe_tower_prefix[i]
+            + (tool_ordering.tools_for_layer(layers_to_print[i].first).has_wipe_tower ? 1 : 0);
+
+    // Progress reporting: layers finish concurrently and out of global order across chunks, so
+    // this counts "how many of n_layers are done", not "which specific layer index" (see below).
+    std::atomic<size_t> layers_done{0};
+
+    std::vector<std::string>            chunk_text(n_real_chunks);
+    std::vector<std::unique_ptr<GCode>> chunk_workers(n_real_chunks);
+    const bool has_wipe_tower_for_print = tool_ordering.has_wipe_tower();
+
+    // Snapshot the handful of *this fields clone_for_parallel_chunk() needs, serially, right here
+    // -- i.e. before chunk 0 (which reuses *this) starts mutating some of them concurrently.
+    const ParallelChunkSharedState shared_state{
+        m_placeholder_parser_integration.parser, m_calib_config, m_origin,
+        m_enable_cooling_markers, m_enable_exclude_object, m_label_objects_ids,
+        m_silent_time_estimator_enabled, m_layer_count};
+
+    // Build every non-chunk-0 worker serially, *before* launching the parallel region below.
+    // clone_for_parallel_chunk() calls SeamPlacer::init(), which itself runs a tbb::parallel_for
+    // over the (shared, read-only-in-principle) Print/PrintObject/mesh data; SeamPlacer's own
+    // internal analysis passes (enforcer/blocker gathering, occlusion, overhang embedding) were
+    // never audited for hidden per-object memoization caches, so running several of them
+    // concurrently is not provably race-free. Doing this construction serially removes that risk;
+    // only the actual per-layer text generation below (the expensive part) runs concurrently.
+    for (size_t c = 1; c < n_real_chunks; ++c) {
+        const size_t begin = ranges[c].first;
+        const LayerTools  &first_layer_tools = tool_ordering.tools_for_layer(layers_to_print[begin].first);
+        const unsigned int seed_extruder  = !first_layer_tools.extruders.empty()
+            ? first_layer_tools.extruders.front()
+            : (unsigned int) std::max(0, tool_ordering.get_most_used_extruder());
+        const float        last_z_before  = (begin > 0) ? float(layers_to_print[begin - 1].first) : 0.f;
+        chunk_workers[c] = this->clone_for_parallel_chunk(const_cast<Print &>(print), tool_ordering, shared_state,
+            has_wipe_tower_for_print, wipe_tower_prefix[begin] - 1, seed_extruder, last_z_before, int(begin) - 1);
+        print.throw_if_canceled();
+    }
+
+    tbb::parallel_for(size_t(0), n_real_chunks, [&](size_t c) {
+        const size_t begin = ranges[c].first, end = ranges[c].second;
+        GCode *worker = (c == 0) ? this : chunk_workers[c].get();
+
+        std::string &out = chunk_text[c];
+        for (size_t i = begin; i < end; ++i) {
+            const auto       &layer_pair  = layers_to_print[i];
+            const LayerTools  &layer_tools = tool_ordering.tools_for_layer(layer_pair.first);
+            if (worker->m_wipe_tower && layer_tools.has_wipe_tower)
+                worker->m_wipe_tower->next_layer();
+            print.throw_if_canceled();
+            // Layers finish out of global order across chunks, so this can't report "layer N of M"
+            // the way the serial path does; it reports how many of the n_layers are done so far,
+            // which is enough to keep the GUI progress bar/percentage moving.
+            const size_t done = ++layers_done;
+            print.set_status(80, Slic3r::format(_(L("Generating G-code: layer %1%")), std::to_string(done)));
+            const bool last_layer_overall = (i + 1 == n_layers);
+            LayerResult lr = worker->process_layer(print, layer_pair.second, layer_tools, last_layer_overall,
+                &print_object_instances_ordering, tool_ordering.get_most_used_extruder(), size_t(-1));
+            if (lr.nop_layer_result)
+                continue;
+            std::string cooled = worker->m_cooling_buffer->process_layer(std::move(lr.gcode), lr.layer_id, lr.cooling_buffer_flush);
+            if (worker->m_config.fan_speedup_time.value != 0 || worker->m_config.fan_kickstart.value > 0) {
+                if (worker->m_fan_mover.get() == nullptr)
+                    worker->m_fan_mover.reset(new Slic3r::FanMover(
+                        worker->m_writer,
+                        std::abs((float)worker->m_config.fan_speedup_time.value),
+                        worker->m_config.fan_speedup_time.value > 0,
+                        worker->m_config.use_relative_e_distances.value,
+                        worker->m_config.fan_speedup_overhangs.value,
+                        (float)worker->m_config.fan_kickstart.value));
+                // Flush every call: chunk boundaries are already an accepted discontinuity.
+                cooled = worker->m_fan_mover->process_gcode(cooled, true);
+            }
+            if (worker->m_pa_processor)
+                cooled = worker->m_pa_processor->process_layer(std::move(cooled));
+            out += cooled;
+        }
+    });
+
+    for (size_t c = 0; c < n_real_chunks; ++c)
+        output_stream.write(chunk_text[c]);
+
+    // Resynchronize *this (used for chunk 0) with the true tail state, so any code that runs
+    // after this call (e.g. machine_end_gcode's placeholder context) sees the real last tool/
+    // position instead of chunk 0's own.
+    if (n_real_chunks > 0 && chunk_workers[n_real_chunks - 1]) {
+        const GCode &last_worker = *chunk_workers[n_real_chunks - 1];
+        if (last_worker.m_writer.filament())
+            this->m_writer.reseat_current_extruder(last_worker.m_writer.filament()->id());
+        this->m_last_pos             = last_worker.m_last_pos;
+        this->m_last_pos_defined     = last_worker.m_last_pos_defined;
+        this->m_last_layer_z         = last_worker.m_last_layer_z;
+        this->m_max_layer_z          = std::max(this->m_max_layer_z, last_worker.m_max_layer_z);
+        this->m_last_extrusion_role  = last_worker.m_last_extrusion_role;
+        this->m_second_layer_things_done = true;
+    }
 }
 
 std::string GCode::placeholder_parser_process(const std::string &name, const std::string &templ, unsigned int current_filament_id, const DynamicConfig *config_override)
@@ -8337,7 +8594,7 @@ std::string GCode::extrude_loop(const ExtrusionLoop&                       loop_
     float seam_overhang = std::numeric_limits<float>::lowest();
     if (!m_config.spiral_mode && description == "perimeter") {
         assert(m_layer != nullptr);
-        m_seam_placer.place_seam(m_layer, loop, last_pos, seam_overhang);
+        m_seam_placer->place_seam(m_layer, loop, last_pos, seam_overhang);
     } else
         loop.split_at(last_pos, false);
 

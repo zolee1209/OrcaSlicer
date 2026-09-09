@@ -1501,6 +1501,16 @@ int CLI::run(int argc, char **argv)
         }
     }
 
+    // ORCA: --parallel, chunked multi-threaded per-layer g-code text generation (fast, approximate
+    // slice). Read before the start_gui decision below and pushed onto Print's process-wide default,
+    // so it also takes effect if the GUI ends up starting (e.g. run from a terminal with --parallel
+    // present but no --slice action) and not just for the CLI slicing loop further down.
+    bool parallel_export = false;
+    ConfigOptionBool* parallel_export_option = m_config.option<ConfigOptionBool>("parallel");
+    if (parallel_export_option)
+        parallel_export = parallel_export_option->value;
+    Print::set_default_parallel_gcode_export(parallel_export);
+
     bool start_gui = m_actions.empty() && !downward_check;
     if (start_gui) {
         BOOST_LOG_TRIVIAL(info) << "no action, start gui directly" << std::endl;
@@ -6545,6 +6555,7 @@ int CLI::run(int argc, char **argv)
             glfwWindowHint(GLFW_ALPHA_BITS, 8);
             glfwWindowHint(GLFW_VISIBLE, false);
 #ifdef __WXMAC__
+            // macOS only ever provides Core-profile contexts.
             glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
             glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
 #else
@@ -6562,7 +6573,11 @@ int CLI::run(int argc, char **argv)
             }
 #endif
             if (thumb_ctx.window == NULL) {
-                BOOST_LOG_TRIVIAL(warning) << "Failed to create GLFW window – gcode thumbnails will be skipped";
+                const char* glfw_err_msg = nullptr;
+                int glfw_err_code = glfwGetError(&glfw_err_msg);
+                BOOST_LOG_TRIVIAL(warning) << "Failed to create GLFW window (code=" << glfw_err_code
+                    << " msg=" << (glfw_err_msg ? glfw_err_msg : "none")
+                    << ") – gcode thumbnails will be skipped";
             } else {
                 glfwMakeContextCurrent(thumb_ctx.window);
                 if (thumb_ctx.opengl_mgr.init_gl(false)) {
@@ -6903,6 +6918,9 @@ int CLI::run(int argc, char **argv)
                         part_plate->get_print(&print, &gcode_result, &print_index);
 
                         print_fff = dynamic_cast<Print *>(print);
+                        // ORCA: --parallel, chunked multi-threaded g-code text generation.
+                        if (print_fff)
+                            print_fff->set_parallel_gcode_export(parallel_export);
                         /*if (outfile_config.empty())
                         {
                             outfile = "plate_" + std::to_string(index + 1) + ".gcode";
