@@ -1225,6 +1225,166 @@ int CLI::run_gcode_stats_action(const std::string &gcode_file, const std::string
     return 0;
 }
 
+// Orca custom: --arrange-info summary. Walks every plate built by the arrange
+// step and reports, per plate, how many instances of each (display-named)
+// model landed on it, plus the filament/extruder ids used on that plate (so
+// multicolor placement, e.g. forced wipe-tower plates, is visible too).
+// Anything that did not make it onto any plate (arrange overflow, or an
+// instance explicitly marked non-printable) is reported separately under
+// "unplaced". See CLIActionsConfigDef::arrange_info and
+// CLIMiscConfigDef::arrange_info_format/arrange_info_file in PrintConfig.cpp.
+static int write_arrange_info_summary(Slic3r::GUI::PartPlateList &partplate_list, Model &model, DynamicPrintConfig &full_config,
+                                       const std::map<size_t, std::string> &display_names,
+                                       const std::string &format, const std::string &out_path)
+{
+    struct PlateSummary {
+        std::map<std::string, int> counts;
+        std::vector<int>           filaments; // 1-based filament/extruder ids used on this plate
+    };
+
+    const int                  plate_count = partplate_list.get_plate_count();
+    std::vector<PlateSummary>  plates(plate_count);
+    std::map<std::string, int> unplaced_counts;
+    std::map<std::string, int> requested_counts;
+
+    for (size_t oidx = 0; oidx < model.objects.size(); ++oidx) {
+        ModelObject *mo = model.objects[oidx];
+        auto name_it = display_names.find(mo->id().id);
+        const std::string &display_name = (name_it != display_names.end()) ? name_it->second : mo->name;
+
+        for (size_t inst_idx = 0; inst_idx < mo->instances.size(); ++inst_idx) {
+            requested_counts[display_name]++;
+
+            if (!mo->instances[inst_idx]->printable) {
+                unplaced_counts[display_name]++;
+                continue;
+            }
+
+            bool placed = false;
+            for (int p = 0; p < plate_count; ++p) {
+                Slic3r::GUI::PartPlate *plate = partplate_list.get_plate(p);
+                if (plate->contain_instance((int) oidx, (int) inst_idx)) {
+                    plates[p].counts[display_name]++;
+                    placed = true;
+                    break;
+                }
+            }
+            if (!placed)
+                unplaced_counts[display_name]++;
+        }
+    }
+
+    for (int p = 0; p < plate_count; ++p) {
+        if (!plates[p].counts.empty())
+            plates[p].filaments = partplate_list.get_plate(p)->get_extruders_under_cli(true, full_config);
+    }
+
+    const ConfigOptionStrings *filament_colours = full_config.option<ConfigOptionStrings>("filament_colour");
+
+    std::ostringstream out;
+    if (format == "json") {
+        json j;
+        json plates_json = json::array();
+        for (int p = 0; p < plate_count; ++p) {
+            if (plates[p].counts.empty())
+                continue;
+            json pj;
+            pj["plate"] = p + 1;
+            json objects_json = json::object();
+            int  total_on_plate = 0;
+            for (const auto &kv : plates[p].counts) {
+                objects_json[kv.first] = kv.second;
+                total_on_plate += kv.second;
+            }
+            pj["objects"]          = objects_json;
+            pj["instance_count"]   = total_on_plate;
+            json filaments_json    = json::array();
+            for (int filament_id : plates[p].filaments)
+                filaments_json.push_back(filament_id);
+            pj["filaments"]         = filaments_json;
+            pj["needs_wipe_tower"]  = plates[p].filaments.size() > 1;
+            plates_json.push_back(pj);
+        }
+        j["plates"]      = plates_json;
+        j["plate_count"] = plate_count;
+
+        json unplaced_json = json::object();
+        for (const auto &kv : unplaced_counts)
+            unplaced_json[kv.first] = kv.second;
+        j["unplaced"] = unplaced_json;
+
+        json totals_json = json::object();
+        for (const auto &kv : requested_counts) {
+            json tj;
+            tj["requested"] = kv.second;
+            auto up_it = unplaced_counts.find(kv.first);
+            tj["placed"] = kv.second - (up_it != unplaced_counts.end() ? up_it->second : 0);
+            totals_json[kv.first] = tj;
+        }
+        j["totals"] = totals_json;
+
+        out << j.dump(2);
+    } else {
+        for (int p = 0; p < plate_count; ++p) {
+            if (plates[p].counts.empty())
+                continue;
+            out << "Plate " << (p + 1) << ":";
+            bool first = true;
+            for (const auto &kv : plates[p].counts) {
+                out << (first ? " " : ", ") << kv.first << " x" << kv.second;
+                first = false;
+            }
+            if (!plates[p].filaments.empty()) {
+                out << " [filament" << (plates[p].filaments.size() > 1 ? "s" : "") << ": ";
+                for (size_t i = 0; i < plates[p].filaments.size(); ++i) {
+                    if (i > 0)
+                        out << ",";
+                    int filament_id = plates[p].filaments[i];
+                    out << filament_id;
+                    if (filament_colours && filament_id >= 1 && (size_t) filament_id <= filament_colours->values.size())
+                        out << "(" << filament_colours->values[filament_id - 1] << ")";
+                }
+                if (plates[p].filaments.size() > 1)
+                    out << ", wipe tower required";
+                out << "]";
+            }
+            out << std::endl;
+        }
+        if (!unplaced_counts.empty()) {
+            out << "Unplaced:";
+            bool first = true;
+            for (const auto &kv : unplaced_counts) {
+                out << (first ? " " : ", ") << kv.first << " x" << kv.second;
+                first = false;
+            }
+            out << std::endl;
+        }
+        out << "Total:";
+        bool first = true;
+        for (const auto &kv : requested_counts) {
+            auto up_it = unplaced_counts.find(kv.first);
+            int  unplaced = (up_it != unplaced_counts.end()) ? up_it->second : 0;
+            out << (first ? " " : ", ") << kv.first << " " << (kv.second - unplaced) << "/" << kv.second;
+            first = false;
+        }
+        out << " on " << plate_count << " plate" << (plate_count == 1 ? "" : "s") << std::endl;
+    }
+
+    const std::string out_str = out.str();
+    if (!out_path.empty()) {
+        boost::nowide::ofstream ofs(out_path);
+        if (!ofs.good()) {
+            boost::nowide::cerr << "arrange_info: can not open output file: " << out_path << std::endl;
+            return CLI_CONFIG_FILE_ERROR;
+        }
+        ofs << out_str;
+        BOOST_LOG_TRIVIAL(info) << "arrange_info: wrote " << out_path;
+    } else {
+        boost::nowide::cout << out_str << std::flush;
+    }
+    return 0;
+}
+
 int CLI::run(int argc, char **argv)
 {
     // Mark the main thread for the debugger and for runtime checks.
@@ -1431,6 +1591,23 @@ int CLI::run(int argc, char **argv)
         flush_and_exit(CLI_INVALID_PARAMS);
     }
     std::map<std::string, std::string> record_key_values;
+
+    // Orca custom: --arrange-info detection. Checked against m_actions (populated
+    // only from options actually present on the command line, see CLI::setup())
+    // rather than the option's value, since --slice's default value (0) is itself
+    // a valid "slice all plates" request.
+    bool arrange_info_only = std::find(m_actions.begin(), m_actions.end(), "arrange_info") != m_actions.end();
+    if (arrange_info_only) {
+        static const std::vector<std::string> arrange_info_conflicts =
+            {"slice", "export_3mf", "export_stl", "export_stls", "export_slicedata", "load_slicedata", "export_settings"};
+        for (const std::string &conflict : arrange_info_conflicts) {
+            if (std::find(m_actions.begin(), m_actions.end(), conflict) != m_actions.end()) {
+                boost::nowide::cerr << "arrange_info: can not be combined with --" << conflict << std::endl;
+                record_exit_reson(outfile_dir, CLI_INVALID_PARAMS, 0, cli_errors[CLI_INVALID_PARAMS], sliced_info);
+                flush_and_exit(CLI_INVALID_PARAMS);
+            }
+        }
+    }
 
     ConfigOptionBool* downward_check_option = m_config.option<ConfigOptionBool>("downward_check");
     if (downward_check_option)
@@ -1763,6 +1940,17 @@ int CLI::run(int argc, char **argv)
         load_assemble_list = load_assemble_list_option->value;
 
     bool allow_multicolor_oneplate = m_config.option<ConfigOptionBool>("allow_multicolor_oneplate", true)->value;
+    arrangement::ArrangeMode arrange_mode = arrangement::ArrangeMode::Fast;
+    {
+        const std::string arrange_mode_str = m_config.option<ConfigOptionString>("arrange_mode", true)->value;
+        if (arrange_mode_str == "nest")
+            arrange_mode = arrangement::ArrangeMode::Nest;
+        else if (arrange_mode_str != "fast" && !arrange_mode_str.empty()) {
+            BOOST_LOG_TRIVIAL(error) << "invalid arrange_mode " << arrange_mode_str << ", should be fast or nest";
+            record_exit_reson(outfile_dir, CLI_INVALID_PARAMS, 0, cli_errors[CLI_INVALID_PARAMS], sliced_info);
+            flush_and_exit(CLI_INVALID_PARAMS);
+        }
+    }
     const std::vector<int>  loaded_filament_ids  = m_config.option<ConfigOptionInts>("load_filament_ids", true)->values;
     const std::vector<int>  clone_objects  = m_config.option<ConfigOptionInts>("clone_objects", true)->values;
     //when load objects from stl/obj, the total used filaments set
@@ -1809,6 +1997,11 @@ int CLI::run(int argc, char **argv)
     BOOST_LOG_TRIVIAL(info) << boost::format("plate_to_slice=%1%, normative_check=%2%, use_first_fila_as_default=%3%")%plate_to_slice %normative_check %use_first_fila_as_default;
     unsigned int input_index = 0;
     std::vector<RGBA> input_obj_colours;
+    // Orca custom: for --arrange-info, maps each ModelObject's stable id to the
+    // "display name" to group it under in the per-plate summary. --clone-objects
+    // siblings get this populated below (to their shared pre-suffix name); objects
+    // that are not CLI-cloned are simply looked up by their own ModelObject::name.
+    std::map<size_t, std::string> arrange_info_display_names;
     if (!load_assemble_list.empty() && ((m_input_files.size() > 0) || (m_transforms.size() > 0)))
     {
         BOOST_LOG_TRIVIAL(error) << boost::format("load_assemble_list should not be used with input model files to load and should not be sued with transforms");
@@ -2051,11 +2244,16 @@ int CLI::run(int argc, char **argv)
                         for (unsigned int obj_index = 0; obj_index < object_count; obj_index++)
                         {
                             ModelObject* object = model.objects[obj_index];
+                            // Orca custom: remember the pre-clone name so --arrange-info can
+                            // group this object with its clones below under one display name.
+                            const std::string arrange_info_base_name = object->name;
+                            arrange_info_display_names[object->id().id] = arrange_info_base_name;
 
                             for (unsigned int clone_index = 1; clone_index < clone_count; clone_index++)
                             {
                                 ModelObject* newObj = model.add_object(*object);
                                 newObj->name = object->name +"_"+ std::to_string(clone_index+1);
+                                arrange_info_display_names[newObj->id().id] = arrange_info_base_name;
                             }
                             object->name = object->name +"_"+ std::to_string(1);
                         }
@@ -4226,6 +4424,14 @@ int CLI::run(int argc, char **argv)
             for (ModelObject* o : model.objects)
             {
                 ModelObject* new_object = m.add_object(*o);
+                // Orca custom: add_object() clones with a brand new ObjectID, so carry
+                // forward the --arrange-info display name (if any) under the new id too,
+                // otherwise the per-plate summary loses the clone grouping done above.
+                if (!arrange_info_display_names.empty()) {
+                    auto display_name_it = arrange_info_display_names.find(o->id().id);
+                    arrange_info_display_names[new_object->id().id] =
+                        (display_name_it != arrange_info_display_names.end()) ? display_name_it->second : o->name;
+                }
                 //BOOST_LOG_TRIVIAL(info) << "object "<<o->name <<", id :" << o->id().id << "\n";
                 //orients_requirement.emplace(new_object->id().id, orients_requirement[o->id().id]);
                 //orients_requirement.erase(o->id().id);
@@ -5679,6 +5885,7 @@ int CLI::run(int argc, char **argv)
                 //Step-2:prepare the arrange params
                 arrange_cfg.allow_rotations = allow_rotations;
                 arrange_cfg.allow_multi_materials_on_same_plate = allow_multicolor_oneplate;
+                arrange_cfg.mode = arrange_mode;
                 arrange_cfg.avoid_extrusion_cali_region = avoid_extrusion_cali_region;
                 arrange_cfg.clearance_height_to_rod = height_to_rod;
                 arrange_cfg.clearance_height_to_lid = height_to_lid;
@@ -6162,6 +6369,7 @@ int CLI::run(int argc, char **argv)
                 //Step-2:prepare the arrange params
                 arrange_cfg.allow_rotations  = allow_rotations;
                 arrange_cfg.allow_multi_materials_on_same_plate = allow_multicolor_oneplate;
+                arrange_cfg.mode = arrange_mode;
                 arrange_cfg.avoid_extrusion_cali_region         = avoid_extrusion_cali_region;
                 arrange_cfg.clearance_height_to_rod             = height_to_rod;
                 arrange_cfg.clearance_height_to_lid             = height_to_lid;
@@ -6484,6 +6692,31 @@ int CLI::run(int argc, char **argv)
         for (auto &model : m_models)
             for (auto &o : model.objects)
                 o->ensure_on_bed();
+    }
+
+    // Orca custom: --arrange-info stops here, right after arranging and before any
+    // slicing/export/OpenGL setup. By this point all plates (including extra plates
+    // created by clone/duplicate overflow, and the assemble-list path) have already
+    // been rebuilt by the arrange step above.
+    if (arrange_info_only) {
+        const std::string arrange_info_format = m_config.opt_string("arrange_info_format");
+        const std::string arrange_info_file   = m_config.opt_string("arrange_info_file");
+        Model empty_model;
+        Model &arrange_info_model = m_models.empty() ? empty_model : m_models[0];
+        int ret = write_arrange_info_summary(partplate_list, arrange_info_model, m_print_config,
+                                              arrange_info_display_names, arrange_info_format, arrange_info_file);
+#if defined(__linux__) || defined(__LINUX__)
+        if (g_cli_callback_mgr.is_started()) {
+            PrintBase::SlicingStatus slicing_status{100, "All done, Success"};
+            cli_status_callback(slicing_status);
+        }
+        g_cli_callback_mgr.stop();
+#endif
+        for (Model &model : m_models)
+            model.remove_backup_path_if_exist();
+        boost::nowide::cout.flush();
+        boost::nowide::cerr.flush();
+        return ret;
     }
 
     // ---------------------------------------------------------------------------

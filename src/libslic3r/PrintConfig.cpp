@@ -12721,6 +12721,22 @@ CLIActionsConfigDef::CLIActionsConfigDef()
     def->cli_params = "option";
     def->set_default_value(new ConfigOptionInt(0));
 
+    // Orca custom: run only the model loading + auto-arrange pipeline (including
+    // --clone-objects, multi-plate overflow and multicolor/wipe-tower placement
+    // rules) and print, per plate, how many instances of each model fit -- no
+    // slicing, no g-code/3mf export, no OpenGL/thumbnail setup. Useful to quickly
+    // answer "how many plates and how are the clones split across them" without
+    // paying the cost of a full slice. Must not be combined with an action that
+    // slices or exports (see CLIMiscConfigDef::arrange_info_format/arrange_info_file
+    // for the output options).
+    def = this->add("arrange_info", coBool);
+    def->label = L("Output arrange info");
+    def->tooltip = L("Run only the auto-arrange step (honoring --clone-objects, --allow-multicolor-oneplate, "
+                     "--allow-rotations, --arrange-mode, --object-distance) and print, per plate, how many "
+                     "instances of each model fit. No slicing or export is performed. Can not be combined with "
+                     "--slice or an export action.");
+    def->set_default_value(new ConfigOptionBool(false));
+
     def = this->add("help", coBool);
     def->label = L("Help");
     def->tooltip = L("This shows command help.");
@@ -13167,6 +13183,31 @@ CLIMiscConfigDef::CLIMiscConfigDef()
                      "Defaults to: 0 (auto).");
     def->cli_params = "0.0";
     def->set_default_value(new ConfigOptionFloat(0.0));
+
+    def = this->add("arrange_mode", coString);
+    def->label = L("Arrange mode");
+    def->tooltip = L("Arrangement algorithm used by the command line interface: "
+                     "\"fast\" packs the bounding boxes of the objects (rectangular beds, orientations of 0/90 degrees, "
+                     "45 degrees for objects that do not fit otherwise), \"nest\" is the general purpose nesting. "
+                     "The fast mode falls back to nesting for the cases it does not support. "
+                     "Defaults to: fast.");
+    def->cli_params = "fast|nest";
+    def->set_default_value(new ConfigOptionString("fast"));
+
+    // Orca custom: output options for the --arrange-info action (see
+    // CLIActionsConfigDef::arrange_info).
+    def = this->add("arrange_info_format", coString);
+    def->label = L("Arrange info output format");
+    def->tooltip = L("Output format for --arrange-info: \"text\" prints a human-readable summary, "
+                     "\"json\" prints a machine-readable summary. Defaults to: text.");
+    def->cli_params = "text|json";
+    def->set_default_value(new ConfigOptionString("text"));
+
+    def = this->add("arrange_info_file", coString);
+    def->label = L("Arrange info output file");
+    def->tooltip = L("With --arrange-info, write the summary to this file instead of stdout.");
+    def->cli_params = "output.txt";
+    def->set_default_value(new ConfigOptionString());
 
     def = this->add("allow_multicolor_oneplate", coBool);
     def->label = L("Allow multiple colors on one plate");

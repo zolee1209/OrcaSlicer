@@ -1,6 +1,7 @@
 #include "Arrange.hpp"
 #include "ExPolygon.hpp"
 #include "Point.hpp"
+#include "ArrangeFast.hpp"
 #include "Print.hpp"
 #include "BoundingBox.hpp"
 #include "PrintConfig.hpp"
@@ -1212,6 +1213,14 @@ void arrange(ArrangePolygons &      items,
              const Points &         bed,
              const ArrangeParams &  params)
 {
+    if (params.mode == ArrangeMode::Fast && bed.size() > 1) {
+        // The bed is handled as its bounding box.
+        const BoundingBox bb(bed);
+        if ((1.0 - poly_area(bed) / area(bb)) >= 1e-3)
+            BOOST_LOG_TRIVIAL(warning) << "arrange_fast: the bed is not a rectangle, its bounding box is used";
+        if (arrange_fast(items, excludes, bb, params))
+            return;
+    }
     call_with_bed(bed, [&](const auto &bin) {
         arrange(items, excludes, bin, params);
     });
