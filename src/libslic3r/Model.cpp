@@ -2619,13 +2619,17 @@ std::vector<int> ModelVolume::get_extruders() const
         std::vector<indexed_triangle_set> its_per_type;
         mmuseg_extruders.clear();
         mmuseg_ts = mmu_segmentation_facets.timestamp();
-        mmu_segmentation_facets.get_facets(*this, its_per_type);
-        for (int idx = 1; idx < its_per_type.size(); idx++) {
-            indexed_triangle_set& its = its_per_type[idx];
-            if (its.indices.empty())
-                continue;
+        // Unpainted volumes (the common case, e.g. every CLI clone) have no painted facets,
+        // so building a TriangleSelector over the whole mesh would only yield an empty list.
+        if (!mmu_segmentation_facets.empty()) {
+            mmu_segmentation_facets.get_facets(*this, its_per_type);
+            for (int idx = 1; idx < its_per_type.size(); idx++) {
+                indexed_triangle_set& its = its_per_type[idx];
+                if (its.indices.empty())
+                    continue;
 
-            mmuseg_extruders.push_back(idx);
+                mmuseg_extruders.push_back(idx);
+            }
         }
     }
 

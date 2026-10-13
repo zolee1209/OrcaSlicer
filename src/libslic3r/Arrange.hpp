@@ -105,7 +105,13 @@ struct ArrangePolygon {
 
 using ArrangePolygons = std::vector<ArrangePolygon>;
 
+/// Arrangement backend. Nest is the general purpose nesting (libnest2d), Fast is the bounding box based packer
+/// for rectangular beds (see ArrangeFast.hpp); Fast falls back to Nest for the cases it does not support.
+enum class ArrangeMode { Nest, Fast };
+
 struct ArrangeParams {
+
+    ArrangeMode mode = ArrangeMode::Nest;
 
     /// The minimum distance which is allowed for any
     /// pair of items on the print bed in any direction.
@@ -160,6 +166,7 @@ struct ArrangeParams {
         ret += "\"min_obj_distance\":" + std::to_string(min_obj_distance) + ",";
         ret += "\"accuracy\":" + std::to_string(accuracy) + ",";
         ret += "\"parallel\":" + std::to_string(parallel) + ",";
+        ret += std::string("\"mode\":\"") + (mode == ArrangeMode::Fast ? "fast" : "nest") + "\",";
         ret += "\"allow_rotations\":" + std::to_string(allow_rotations) + ",";
         ret += "\"do_final_align\":" + std::to_string(do_final_align) + ",";
         ret += "\"allow_multi_materials_on_same_plate\":" + std::to_string(allow_multi_materials_on_same_plate) + ",";

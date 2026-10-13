@@ -56,3 +56,7 @@ __pycache__/
 *.pyc
 *.opc
 /.test/
+
+# Local scratch
+/test_commands.txt
+/log/

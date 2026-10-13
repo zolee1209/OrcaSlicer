@@ -4506,6 +4506,11 @@ std::unique_ptr<GCode> GCode::clone_for_parallel_chunk(
     clone->m_calib_config = shared.calib_config;
     clone->m_origin       = shared.origin;
 
+    // Same writer setup as do_export() does for the main worker: without the plate offset every
+    // chunk of a plate other than the first one is emitted shifted by the plate origin.
+    clone->m_writer.set_xy_offset(print.get_plate_origin()(0), print.get_plate_origin()(1));
+    clone->m_writer.set_is_bbl_machine(print.is_BBL_printer());
+
     clone->set_extruders(tool_ordering.all_extruders());
     clone->m_writer.init_extruder(seed_extruder_id);
 
