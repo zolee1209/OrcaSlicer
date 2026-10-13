@@ -9,21 +9,22 @@
 #   owned_files         csak a forkban létező fájlok (ütközésmentesek)
 #   hooks               upstream fájlok, amelyekbe a funkció belenyúl (ütközési kockázat)
 #   cli / config / env  új CLI-opciók, config-kulcsok, környezeti változók
-#   commits             commitok a custom/rebased-2026-09 ágon (alap: upstream 1170b048e8)
+#   commits             commitok a custom/rebased-2026-10 ágon (alap: upstream 008ee792f6)
 #   upstream_equivalent upstream megfelelő, ha van
 #   used_by             a www alkalmazás hivatkozásai (null = jelenleg nem használt)
 #   test                regressziós teszt (null = nincs még)
 #   notes               nyitott kérdések, döntések
 #
 # Döntések: 2026-10-13 (lásd a decision mezőket).
-# Állapot: 2026-10-13, ág custom/rebased-2026-09 @ 4d976bac18. Kódcímkék még NINCSENEK elhelyezve.
+# Állapot: 2026-10-13, ág custom/rebased-2026-10 (upstream 008ee792f6 + fork). Kódcímkék csak a
+# cli-preset-resolver funkciónál vannak elhelyezve. Build és teszt még NINCS.
 
 # Szinkron-beállítások – a fork/tools scriptek olvassák.
 sync:
   upstream_remote: upstream
   upstream_branch: main
   fork_remote: origin
-  fork_branch: custom/rebased-2026-09   # a fork fő ága; sikeres szinkron után az új ágra frissítendő
+  fork_branch: custom/rebased-2026-10   # a fork fő ága; sikeres szinkron után az új ágra frissítendő
   cadence_days: 30            # ennyi nap után ajánlja fel a session-status a szinkron-riportot
   ignore:                     # ezek az upstream változások nem jelennek meg a riportban
     - "resources/profiles/**" # kivéve: profiles-vendor-prune keep + keep_upstream
@@ -48,14 +49,15 @@ features:
     status: fork-only
     owned_files: [src/libslic3r/CliPresetResolver.cpp, src/libslic3r/CliPresetResolver.hpp]
     hooks: [src/OrcaSlicer.cpp, src/libslic3r/CMakeLists.txt]
-    commits: [001591cade]
+    commits: [db43e2bb85, 0471e628b1]
     upstream_equivalent: "OrcaSlicer.cpp resolve_preset + PresetBundle::resolve_preset_config / resolve_preset_config_type (#15953, #16038, #16047, #15693)"
     decision: "2026-10-13: a saját resolver marad (egyelőre)."
     used_by: null
     test: null
     notes: >
       Rebase-szabály: a saját CliPresetResolver marad, az upstream resolve_preset nem váltja ki.
-      A 2026-10-13-i próba-rebase ezt rosszul oldotta fel (az upstream maradt) – újra kell csinálni.
+      A 0471e628b1 visszaállította, az upstream kódútra épülő FORK blokkal a load_config_file-ban:
+      típus a mappanévből → CliPresetResolver → upstream resolve_preset → típusos presetnél nyers fájl.
       A saját megoldás 'system/' és 'user/' testvérmappákat is bejár (max. 6 szint felfelé).
 
   - id: cli-idex-multicolor
@@ -65,7 +67,7 @@ features:
     hooks: [src/OrcaSlicer.cpp, src/libslic3r/PrintConfig.cpp]
     cli: [--filament-colour]
     config: [filament_colour (CLIMisc)]
-    commits: [001591cade, 84b69f170a]
+    commits: [db43e2bb85, cdea9ce03d]
     upstream_equivalent: "részben: #15636 (GUI mixed filament szabályok CLI-ben), #15639, #16157, #16247"
     decision: "2026-10-13: mindenképp a miénk marad."
     used_by: [routes/api_routes.py run_machine_process (--filament-colour)]
@@ -84,7 +86,7 @@ features:
     hooks: [src/OrcaSlicer.cpp, src/libslic3r/PrintConfig.cpp]
     cli: [--flushing-multiplier, --object-distance]
     config: [flushing_multiplier (CLIMisc), object_distance (CLIMisc)]
-    commits: [84b69f170a]
+    commits: [cdea9ce03d]
     decision: "2026-10-13: marad; jelenleg nem használt, de szükség lehet rá."
     used_by: null
     test: null
@@ -94,7 +96,7 @@ features:
     status: fork-only
     hooks: [src/OrcaSlicer.cpp]
     env: [HOME]
-    commits: [84b69f170a]
+    commits: [cdea9ce03d]
     used_by: [routes/api_routes.py (subprocess.Popen PIPE)]
     test: null
     notes: A www/Flask subprocess.Popen PIPE használatához készült.
@@ -104,7 +106,7 @@ features:
     status: fork-only
     hooks: [src/OrcaSlicer.cpp]
     cli: [--load-settings]
-    commits: [31cd1e6740]
+    commits: [e134a598fd]
     used_by: null
     test: null
 
@@ -114,7 +116,7 @@ features:
     hooks: [src/OrcaSlicer.cpp, src/OrcaSlicer.hpp, src/libslic3r/PrintConfig.cpp]
     cli: [--gcode-stats, --gcode-stats-out]
     config: [gcode_stats (CLIActions), gcode_stats_out (CLIMisc)]
-    commits: [5ff243f626]
+    commits: [de0e87ca61]
     used_by: [utils/reslice_free_recalc.py, config.py]
     test: null
 
@@ -123,7 +125,7 @@ features:
     status: fork-only
     hooks: [src/OrcaSlicer.cpp, src/slic3r/GUI/GLShadersManager.cpp]
     env: [XDG_RUNTIME_DIR, WAYLAND_DISPLAY]
-    commits: [84b69f170a, 49607d49f4]
+    commits: [cdea9ce03d, "5442021239"]
     upstream_equivalent: "részben: upstream GL 3.3 context + fallback a CLI thumbnailnél (2026-10)"
     test: null
     notes: A 49607d49f4 javította a GL kontextus-verziót (3.2); az upstream azóta 3.3-at kér, fallbackkel.
@@ -132,7 +134,7 @@ features:
     name: PartPlate/PartPlateList::set_model – modellmutató frissítése m_models újrafoglalás után (--assemble)
     status: fork-only
     hooks: [src/slic3r/GUI/PartPlate.hpp]
-    commits: [84b69f170a]
+    commits: [cdea9ce03d]
     test: null
 
   - id: fix-glmodel-cli-guard
@@ -142,7 +144,7 @@ features:
     commits: [ebd9b59d8e]
     upstream_equivalent: "upstream/main ugyanezt a védelmet tartalmazza (2026-10)"
     test: null
-    notes: A következő rebase-nél kiesik (üres commit).
+    notes: A 2026-10-es rebase-nél kiesett (üres commit), a custom/rebased-2026-10 ágon már nincs benne.
 
   # ---------------------------------------------------------------- Arrange
 
@@ -153,7 +155,7 @@ features:
     hooks: [src/libslic3r/Arrange.cpp, src/libslic3r/Arrange.hpp, src/libslic3r/CMakeLists.txt, src/OrcaSlicer.cpp, src/libslic3r/PrintConfig.cpp]
     cli: [--arrange-mode, --arrange-info, --arrange-info-format, --arrange-info-file]
     config: [arrange_mode (CLIMisc, alapértelmezés "fast"), arrange_info (CLIActions), arrange_info_format, arrange_info_file]
-    commits: [4d976bac18]
+    commits: [477f05313c]
     used_by: null
     test: null
     notes: >
@@ -168,7 +170,7 @@ features:
     status: fork-only
     hooks: [src/libslic3r/GCode/GCodeProcessor.cpp, src/libslic3r/GCode/GCodeProcessor.hpp, src/libslic3r/GCode.cpp, src/libslic3r/Print.cpp]
     env: [ORCA_SKIP_MOVES_EXPORT]
-    commits: [84b69f170a, c5e6580b07]
+    commits: [cdea9ce03d, 57546d135f]
     used_by: [gcode2gltf.py, utils/lab_imports.py]
     test: null
 
@@ -178,7 +180,7 @@ features:
     hooks: [src/libslic3r/GCode.cpp, src/libslic3r/GCode.hpp, src/libslic3r/GCodeWriter.hpp, src/libslic3r/Print.cpp, src/libslic3r/Print.hpp, src/libslic3r/PrintConfig.cpp, src/OrcaSlicer.cpp]
     cli: [--parallel]
     config: [parallel (CLIMisc)]
-    commits: [49607d49f4, 4d976bac18]
+    commits: ["5442021239", 477f05313c]
     decision: "2026-10-13: a saját megoldás marad."
     used_by: [routes/api_routes.py run_machine_process (--parallel)]
     test: null
@@ -193,7 +195,7 @@ features:
     name: --export-slicedata / --load-slicedata bináris, párhuzamos (de)szerializáció
     status: fork-only
     hooks: [src/libslic3r/Print.cpp]
-    commits: [888405cb6e, 58b69357d0, 5625901be6]
+    commits: [83315d8534, e49b3c5e89, eab4c99e4a]
     decision: "2026-10-13: marad."
     used_by: [routes/api_routes.py run_machine_process (--export-slicedata / --load-slicedata), _slicedata_cache]
     test: null
@@ -207,36 +209,38 @@ features:
     name: Befoglaló-téglalap előszűrés a brim kontakt/no-brim-area ellenőrzésekben
     status: fork-only
     hooks: [src/libslic3r/Brim.cpp]
-    commits: [58666c1874]
+    commits: [b49d4b79db]
     test: null
 
   - id: perf-tsp-cap
     name: TSP utófeldolgozás költségkorlátja (chain_points_with_postprocessing)
     status: fork-only
     hooks: [src/libslic3r/ShortestPath.cpp]
-    commits: [d9bd347454]
+    commits: [df069a9438]
     test: null
 
   - id: fix-mmu-unpainted
     name: ModelVolume::get_extruders – festetlen térfogatnál kimarad a TriangleSelector építés
     status: fork-only
     hooks: [src/libslic3r/Model.cpp]
-    commits: [4d976bac18]
+    commits: [477f05313c]
     test: null
 
   # ---------------------------------------------------------------- GUI
 
   - id: gui-idex-nozzle-combo
     name: Egységes fúvóka-combo mindkét fúvókát állítja nem-BBL kétextruderes (IDEX) gépen
-    status: fork-only
+    status: superseded
     hooks: [src/slic3r/GUI/Plater.cpp]
-    commits: [84b69f170a]
-    decision: "2026-10-13: marad; a mainline viselkedését a felhasználó külön telepítésen ellenőrzi."
+    commits: [cdea9ce03d, b1d69abefd]
+    upstream_equivalent: "upstream variáns-választó combo (Sidebar::priv::switch_diameter_to, multi_extruder_rows) – 2026-10"
+    decision: "2026-10-13 (felülvizsgálva): az upstream marad, a Plater.cpp az upstreammel azonos."
     used_by: null
     test: null
     notes: >
-      A 2026-10-13-i próba-rebase-ben az eseménykezelő része kimaradt (az upstream variant-választó maradt) – újra kell csinálni.
-      Nyitott: a mainline IDEX combo-viselkedésének ellenőrzése (felhasználó).
+      Az upstreamben a combo gép-variánst vált: nem-BBL több extruderes gépen (Ratrig IDEX, nozzle_diameter = 2)
+      az egész printer presetet cseréli, így mindkét fúvóka együtt vált. A fork bal/jobb combo-logikája itt már nem kell.
+      Nyitott: GUI-teszt Ratrig IDEX géppel a build után; ha hibás, a funkció visszaállítható (fork-only).
 
   # ---------------------------------------------------------------- Build
 
@@ -244,7 +248,7 @@ features:
     name: build_linux.sh -x – natív CPU-optimalizált build (skylake-avx512, clang, LTO, strip), dinamikus TBB + bundle
     status: fork-only
     hooks: [build_linux.sh, deps/TBB/TBB.cmake, src/dev-utils/platform/unix/build_linux_image.sh.in]
-    commits: [001591cade]
+    commits: [db43e2bb85]
     test: null
     notes: Leírás a BUILD_OPTIMIZED.md és a BUILD_PERFORMANCE_UBUNTU26.md fájlban.
 
@@ -252,7 +256,7 @@ features:
     name: jemalloc allokátor linkelése (-l:libjemalloc.so.2), ha elérhető
     status: fork-only
     hooks: [build_linux.sh]
-    commits: [c5e6580b07]
+    commits: [57546d135f]
     test: null
 
   # ---------------------------------------------------------------- Profilok / eszközök
@@ -261,7 +265,7 @@ features:
     name: Csak saját profilok a forkban – minden más gyártó profilja törölve a gitből
     status: fork-only
     hooks: [resources/profiles, resources/images/amshub_N6.png]
-    commits: [dd41308900]
+    commits: [22d0a67571, "6530053928"]
     decision: "2026-10-13: a fork gitjében csak saját profilok legyenek; más gyártó profiljaival nem akarunk találkozni."
     used_by: null
     test: null
@@ -274,14 +278,15 @@ features:
       A keep lista tartalmához soha nem nyúl.
       keep_upstream: a telepített rendszer ezeket a Ratrig mellett betölti, a PresetBundle az
       OrcaFilamentLibrary-t alapkönyvtárként kezeli; rebase-nél az upstream változásai ütközés nélkül átjönnek.
-      A 2026-10-13-i állapotban a törlés hiányos volt (41 gyártómappa maradt részben).
+      A 2026-10-es szinkronnál a 6530053928 törölte a maradékot (4750 fájl, 61 gyártó).
+      Mellékhatás: az upstream tests/cli tesztjei (cli_* ctest) a resources/profiles/BBL-t használják, ezért a forkban nem futnak.
 
   - id: profiles-ratrig
     name: Ratrig profilrendszer – fúvóka-variánsok, IDEX COPY/MIRROR mód, filament-kalibráció, egyedi setting_id-k
     status: fork-only
     owned_files: []
     hooks: [resources/profiles/Ratrig, resources/profiles/Ratrig.json, resources/profiles/OrcaFilamentLibrary]
-    commits: [a234a984dd, c8838b1b31, b80db00a81]
+    commits: [59058af7b9, c5b6ddb6be, cec168510d, "6530053928"]
     test: null
     decision: "2026-10-13: SZIGORÚAN saját fájlok. Nem törölhetők, és kifejezett utasítás nélkül nem módosíthatók."
     notes: >
@@ -293,7 +298,7 @@ features:
     name: Ratrig profilkezelő és javító scriptek
     status: fork-only
     owned_files: [scripts/ratrig_profile_tool.py, scripts/assign_vendor_setting_ids.py, fix_ratrig_profiles.py, regenerate_process_compat.py]
-    commits: [a234a984dd, b80db00a81]
+    commits: [59058af7b9, cec168510d]
     test: null
     notes: A fix_ratrig_profiles.py és a regenerate_process_compat.py egyszeri javító script; áthelyezhetők fork/tools/ alá.
 
@@ -304,5 +309,5 @@ features:
     status: fork-only
     owned_files: [fork, .github/instructions/orca-fork.instructions.md, .github/skills/orca-fork]
     hooks: [.gitignore]
-    commits: [4d976bac18]
+    commits: [477f05313c, 5fa2ffd30a]
     test: null

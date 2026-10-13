@@ -62,3 +62,18 @@ Részletek: `fork/features.yaml` (`decision` mezők).
 - `parallel-gcode-export`, `slicedata-cache`, `cli-idex-multicolor`: maradnak; a `--parallel` klónozást
   az upstream export-változásaihoz igazítani kell.
 - Javasolt út: a próba-ág megtartása + célzott javító commitok (olcsóbb, mint az újrakezdés) – jóváhagyásra vár.
+
+## Javítások a próba-ágon (2026-10-13 éjjel)
+
+| Commit | Funkció | Tartalom |
+|---|---|---|
+| 5fa2ffd30a | `fork-meta` | a `cb0947b96f` átvétele (features.yaml, tools, Copilot-szabályok) |
+| 0471e628b1 | `cli-preset-resolver` | saját resolver vissza, FORK blokk az upstream `load_config_file`-ban; keresési mappák a `CliPresetResolver::sibling_search_dirs()`-ben |
+| b1d69abefd | `gui-idex-nozzle-combo` | `Plater.cpp` = upstream; az upstream variáns-választó lefedi → `superseded` (GUI-teszt build után) |
+| 6530053928 | `profiles-vendor-prune`, `profiles-ratrig` | 4750 fájl / 61 gyártó törölve; Ratrig = `backup/pre-rebase-2026-10-13` (az upstream `@RatRig` átnevezések kimaradtak) |
+
+Még nyitott:
+- `--parallel`: a `clone_for_parallel_chunk` igazítása (IMEX offset, #16050).
+- `arrange-fast`: `is_belt`, prime tower, `--align-to-y-axis`.
+- Build (deps rebuild) és CLI-teszt; az upstream `tests/cli` ctest a BBL profilok hiánya miatt nem fut.
+- Opcionális: rebase a friss `upstream/main`-re (+2 commit, `de3af0b7de`).
