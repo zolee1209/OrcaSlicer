@@ -1,7 +1,0 @@
-{
-	"type": "machine",
-	"name": "fdm_machine_common_nextruder",
-	"inherits": "fdm_machine_common",
-	"from": "system",
-	"instantiation": "false"
-}

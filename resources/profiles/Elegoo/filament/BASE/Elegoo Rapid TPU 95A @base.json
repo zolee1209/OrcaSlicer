@@ -1,8 +1,0 @@
-{
-	"type": "filament",
-	"name": "Elegoo Rapid TPU 95A @base",
-	"inherits": "Elegoo TPU 95A @base",
-	"from": "system",
-	"filament_id": "OF30Ftju",
-	"instantiation": "false"
-}
