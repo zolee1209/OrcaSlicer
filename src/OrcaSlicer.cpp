@@ -46,6 +46,7 @@
 #include "libslic3r/PrintConfig.hpp"
 #include "libslic3r/BoundingBox.hpp"
 #include "libslic3r/CustomGCode.hpp"
+#include "libslic3r/CliPresetResolver.hpp" // FORK(cli-preset-resolver)
 #include <memory>
 #include <sstream>
 #include <iomanip>
@@ -2538,14 +2539,47 @@ int CLI::run(int argc, char **argv)
             }
 
             auto type_iter = key_values.find(BBL_JSON_KEY_TYPE);
-            const bool probe_type = type_iter == key_values.end();
+            bool probe_type = type_iter == key_values.end();
             if (!probe_type)
                 config_type = type_iter->second;
 
-            if (!resolve_preset(file, config, config_type, config_from, probe_type, reason)) {
-                boost::nowide::cerr << __FUNCTION__ << boost::format(": can not resolve preset %1%: %2%") % file % reason << std::endl;
-                return CLI_CONFIG_FILE_ERROR;
+            // FORK(cli-preset-resolver) BEGIN: type from the directory name + own inherits resolver;
+            // the upstream resolve_preset is only a fallback, and a failed resolution of a typed
+            // preset falls back to the raw file instead of aborting.
+            if (probe_type) {
+                const std::string dir_name = boost::filesystem::path(file).parent_path().filename().string();
+                if (dir_name == "machine" || dir_name == "process" || dir_name == "filament") {
+                    config_type = dir_name;
+                    probe_type  = false;
+                    BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ": inferred config type \"" << config_type
+                                            << "\" from directory name for " << file;
+                }
             }
+            bool resolved_by_fork = false;
+            if (!probe_type) {
+                const auto *inherits = config.option<ConfigOptionString>(BBL_JSON_KEY_INHERITS);
+                if (inherits != nullptr && !inherits->value.empty()) {
+                    DynamicPrintConfig resolved;
+                    std::string        resolve_reason;
+                    if (CliPresetResolver::resolve(file, config_substitution_rule, resolved, resolve_reason,
+                                                   CliPresetResolver::sibling_search_dirs(file))) {
+                        config           = std::move(resolved);
+                        resolved_by_fork = true;
+                    } else {
+                        BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << ": CliPresetResolver failed for " << file << ": "
+                                                   << resolve_reason << " - trying upstream resolve_preset";
+                    }
+                }
+            }
+            if (!resolved_by_fork && !resolve_preset(file, config, config_type, config_from, probe_type, reason)) {
+                if (probe_type) {
+                    boost::nowide::cerr << __FUNCTION__ << boost::format(": can not resolve preset %1%: %2%") % file % reason << std::endl;
+                    return CLI_CONFIG_FILE_ERROR;
+                }
+                BOOST_LOG_TRIVIAL(warning) << __FUNCTION__ << boost::format(": can not resolve preset %1%: %2% - using the raw file") % file % reason;
+                reason.clear();
+            }
+            // FORK(cli-preset-resolver) END
 
             if (config_type == "machine") {
                 //config.set("printer_settings_id", config_name, true);

@@ -105,6 +105,9 @@ set(lisbslic3r_sources
     calib.hpp
     Circle.cpp
     Circle.hpp
+    # FORK(cli-preset-resolver)
+    CliPresetResolver.cpp
+    CliPresetResolver.hpp
     ClipperUtils.cpp
     ClipperUtils.hpp
     ClipperZUtils.cpp
