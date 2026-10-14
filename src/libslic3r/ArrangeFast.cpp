@@ -14,6 +14,8 @@
 #include <cstdint>
 #include <map>
 #include <numeric>
+#include <optional>
+#include <set>
 #include <vector>
 
 namespace Slic3r { namespace arrangement {
@@ -86,6 +88,10 @@ struct Plate
     std::vector<Rect>   free_rects;
     std::vector<Rect>   obstacles;
     std::vector<Placed> placed;
+    std::set<int>       extruders;              // extruders of the items (and fixed objects) on the plate
+    std::optional<Rect> tower;                  // prime tower footprint, taken once the plate is multi-material
+    bool                tower_reserved{false};  // the prime tower is among the obstacles
+    bool                tower_blocked{false};   // the prime tower overlaps a placed item
 
     void occupy(const Rect &used)
     {
@@ -152,7 +158,7 @@ Polygon inflated_contour(const Polygon &contour, int64_t inflation)
         base.reverse();
     if (inflation == 0)
         return base;
-    ExPolygons res = offset_ex(ExPolygon(base), float(inflation), ClipperLib::jtSquare);
+    ExPolygons res = offset_ex(ExPolygon(base), float(inflation), jtSquare);
     return res.empty() ? base : res.front().contour;
 }
 
@@ -188,10 +194,10 @@ bool arrange_fast(ArrangePolygons &items, const ArrangePolygons &excludes, const
 
     if (params.is_seq_print)
         return unsupported("print sequence is By object");
+    if (params.is_belt)
+        return unsupported("belt printer (belt order packing)");
     if (!params.allow_multi_materials_on_same_plate)
         return unsupported("multiple materials on the same plate are not allowed");
-    if (!params.excluded_regions.empty() || !params.nonprefered_regions.empty())
-        return unsupported("excluded/non-preferred regions are defined");
     if (!bed.defined || bed.size().x() <= 0 || bed.size().y() <= 0)
         return unsupported("invalid bed");
     for (const ArrangePolygon &ap : items)
@@ -234,7 +240,8 @@ bool arrange_fast(ArrangePolygons &items, const ArrangePolygons &excludes, const
                 fitting.push_back(o);
         };
         try_angle(0.);
-        if (params.allow_rotations)
+        // Align to Y axis: the caller pre-rotated the item, so 90 degrees is only a fallback when 0 does not fit.
+        if (params.allow_rotations && !(params.align_to_y_axis && !fitting.empty()))
             try_angle(FAST_PI / 2.);
         if (fitting.empty() && params.allow_rotations) {
             // Neither 0 nor 90 degrees fits: try the diagonal placement (long items) and keep the smaller box.
@@ -267,25 +274,70 @@ bool arrange_fast(ArrangePolygons &items, const ArrangePolygons &excludes, const
         cls.allowed = std::move(fitting);
     }
 
-    // 3. fixed obstacles per plate (e.g. the prime tower)
-    std::map<int, std::vector<Rect>> obstacles;
-    for (const ArrangePolygon &fx : excludes) {
-        if (fx.poly.contour.points.size() < 3)
-            continue;
-        // The nesting backend shrinks fixed items by 2*EPSILON after inflating them.
-        const int64_t infl = int64_t(fx.inflation) - int64_t(scaled(2. * EPSILON));
-        Polygon       p    = fx.poly.contour;
+    // 3. fixed obstacles
+    //  - per plate: the fixed items of that plate (unselected objects, virtual regions)
+    //  - every plate: params.excluded_regions / nonprefered_regions (the latter conservatively kept free)
+    //  - plates the caller did not prepare (overflow): the virtual regions of the first prepared plate
+    //  - prime tower: a conditional obstacle. The caller reserves one on every plate when any plate is
+    //    multi-material, but a single-material plate prints no tower, so it only takes space once the
+    //    plate becomes multi-material (the plate's own tower, else the first plate's tower as template).
+    auto to_obstacle = [](const ArrangePolygon &fx, int64_t infl) {
+        Polygon p = fx.poly.contour;
         if (p.is_clockwise())
             p.reverse();
         if (infl != 0) {
-            ExPolygons res = offset_ex(ExPolygon(p), float(infl), ClipperLib::jtSquare);
+            ExPolygons res = offset_ex(ExPolygon(p), float(infl), jtSquare);
             if (!res.empty())
                 p = res.front().contour;
         }
         p.rotate(fx.rotation);
         p.translate(fx.translation.x(), fx.translation.y());
-        obstacles[std::max(fx.bed_idx, 0)].push_back(to_rect(BoundingBox(p.points)));
+        return to_rect(BoundingBox(p.points));
+    };
+    // The nesting backend shrinks fixed items by 2*EPSILON after inflating them.
+    const int64_t fixed_shrink = int64_t(scaled(2. * EPSILON));
+
+    struct PlateFixed
+    {
+        std::vector<Rect>   rects;
+        std::set<int>       extruders;
+        bool                has_virtual{false};
+        std::optional<Rect> tower;
+    };
+    std::map<int, PlateFixed> fixed;
+    std::optional<Rect>       tower_template;
+    int                       tower_template_bed   = -1;
+    int                       virtual_template_bed = -1;
+    std::map<int, std::vector<Rect>> virtual_rects;
+    for (const ArrangePolygon &fx : excludes) {
+        if (fx.poly.contour.points.size() < 3)
+            continue;
+        const int  bed_idx = std::max(fx.bed_idx, 0);
+        const Rect r       = to_obstacle(fx, int64_t(fx.inflation) - fixed_shrink);
+        PlateFixed &pf     = fixed[bed_idx];
+        if (fx.is_wipe_tower) {
+            pf.tower = r;
+            if (tower_template_bed < 0 || bed_idx < tower_template_bed) {
+                tower_template     = r;
+                tower_template_bed = bed_idx;
+            }
+            continue;
+        }
+        pf.rects.push_back(r);
+        if (fx.is_virt_object) {
+            pf.has_virtual = true;
+            virtual_rects[bed_idx].push_back(r);
+            if (virtual_template_bed < 0 || bed_idx < virtual_template_bed)
+                virtual_template_bed = bed_idx;
+        } else {
+            pf.extruders.insert(fx.extrude_ids.begin(), fx.extrude_ids.end());
+        }
     }
+    std::vector<Rect> every_plate;
+    for (const ArrangePolygons *regions : {&params.excluded_regions, &params.nonprefered_regions})
+        for (const ArrangePolygon &rg : *regions)
+            if (rg.poly.contour.points.size() >= 3)
+                every_plate.push_back(to_obstacle(rg, int64_t(rg.inflation)));
 
     // 4. placement order: priority, extruders, larger first, identical items together
     std::vector<size_t> order(items.size());
@@ -309,15 +361,31 @@ bool arrange_fast(ArrangePolygons &items, const ArrangePolygons &excludes, const
     // 5. pack
     std::vector<Plate> plates;
     auto               open_plate = [&]() -> Plate & {
+        const int plate_idx = int(plates.size());
         plates.emplace_back();
         Plate &pl = plates.back();
         pl.free_rects.push_back(bin);
-        auto it = obstacles.find(int(plates.size()) - 1);
-        if (it != obstacles.end()) {
-            pl.obstacles = it->second;
-            for (const Rect &o : pl.obstacles)
-                pl.occupy(o);
+        auto it = fixed.find(plate_idx);
+        if (it != fixed.end()) {
+            pl.obstacles = it->second.rects;
+            pl.extruders = it->second.extruders;
+            if (it->second.tower)
+                pl.tower = it->second.tower;
         }
+        if (!pl.tower)
+            pl.tower = tower_template;
+        if ((it == fixed.end() || !it->second.has_virtual) && virtual_template_bed >= 0) {
+            const std::vector<Rect> &tmpl = virtual_rects[virtual_template_bed];
+            pl.obstacles.insert(pl.obstacles.end(), tmpl.begin(), tmpl.end());
+        }
+        pl.obstacles.insert(pl.obstacles.end(), every_plate.begin(), every_plate.end());
+        // Fixed objects already make the plate multi-material: the tower is needed from the start.
+        if (pl.tower && pl.extruders.size() > 1) {
+            pl.obstacles.push_back(*pl.tower);
+            pl.tower_reserved = true;
+        }
+        for (const Rect &o : pl.obstacles)
+            pl.occupy(o);
         return pl;
     };
 
@@ -344,14 +412,46 @@ bool arrange_fast(ArrangePolygons &items, const ArrangePolygons &excludes, const
         return found;
     };
 
+    // Like try_plate(), but reserves the prime tower first when the item makes the plate multi-material.
+    // The plate is only changed (tower occupied) when the item fits next to the tower.
+    size_t towers_added = 0;
+    auto   place_on = [&](Plate &pl, const ShapeClass &cls, const std::vector<int> &item_extruders, Choice &out) {
+        bool needs_tower = false;
+        if (pl.tower && !pl.tower_reserved) {
+            std::set<int> ext = pl.extruders;
+            ext.insert(item_extruders.begin(), item_extruders.end());
+            needs_tower = ext.size() > 1;
+        }
+        if (!needs_tower)
+            return try_plate(pl, cls, out);
+        if (pl.tower_blocked)
+            return false;
+        for (const Placed &pd : pl.placed)
+            if (intersects(pd.cell, *pl.tower)) {
+                pl.tower_blocked = true;
+                return false;
+            }
+        std::vector<Rect> saved = pl.free_rects;
+        pl.occupy(*pl.tower);
+        if (!try_plate(pl, cls, out)) {
+            pl.free_rects = std::move(saved);
+            return false;
+        }
+        pl.obstacles.push_back(*pl.tower);
+        pl.tower_reserved = true;
+        ++towers_added;
+        return true;
+    };
+
     std::vector<int>    result_plate(items.size(), 0);
     std::vector<size_t> placed_index(items.size(), 0); // index into Plate::placed
     for (size_t idx : order) {
         const ShapeClass &cls = classes[item_class[idx]];
+        const std::vector<int> &item_extruders = items[idx].extrude_ids;
         Choice            ch;
         int               plate_id = -1;
         for (size_t p = 0; p < plates.size(); ++p)
-            if (try_plate(plates[p], cls, ch)) {
+            if (place_on(plates[p], cls, item_extruders, ch)) {
                 plate_id = int(p);
                 break;
             }
@@ -359,7 +459,7 @@ bool arrange_fast(ArrangePolygons &items, const ArrangePolygons &excludes, const
             if (int(plates.size()) >= FAST_MAX_PLATES)
                 return unsupported("more plates are needed than the maximum");
             Plate &pl = open_plate();
-            if (!try_plate(pl, cls, ch))
+            if (!place_on(pl, cls, item_extruders, ch))
                 return unsupported("an item does not fit on an empty plate (fixed items in the way)");
             plate_id = int(plates.size()) - 1;
         }
@@ -367,6 +467,7 @@ bool arrange_fast(ArrangePolygons &items, const ArrangePolygons &excludes, const
         const Orient &o  = cls.allowed[ch.orient];
         const Rect    cell{ch.x, ch.y, ch.x + o.w, ch.y + o.h};
         pl.occupy(cell);
+        pl.extruders.insert(item_extruders.begin(), item_extruders.end());
         placed_index[idx] = pl.placed.size();
         pl.placed.push_back({idx, ch.orient, cell});
         result_plate[idx] = plate_id;
@@ -432,7 +533,7 @@ bool arrange_fast(ArrangePolygons &items, const ArrangePolygons &excludes, const
 
     const double ms = std::chrono::duration<double, std::milli>(clock::now() - t_start).count();
     BOOST_LOG_TRIVIAL(info) << "arrange_fast: " << items.size() << " items, " << classes.size() << " shape classes, " << plates.size()
-                            << " plate(s), " << ms << " ms";
+                            << " plate(s), " << towers_added << " prime tower(s) reserved, " << ms << " ms";
     return true;
 }
 
