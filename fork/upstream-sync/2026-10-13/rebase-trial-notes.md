@@ -72,8 +72,19 @@ Részletek: `fork/features.yaml` (`decision` mezők).
 | b1d69abefd | `gui-idex-nozzle-combo` | `Plater.cpp` = upstream; az upstream variáns-választó lefedi → `superseded` (GUI-teszt build után) |
 | 6530053928 | `profiles-vendor-prune`, `profiles-ratrig` | 4750 fájl / 61 gyártó törölve; Ratrig = `backup/pre-rebase-2026-10-13` (az upstream `@RatRig` átnevezések kimaradtak) |
 
-Még nyitott:
-- `--parallel`: a `clone_for_parallel_chunk` igazítása (IMEX offset, #16050).
-- `arrange-fast`: `is_belt`, prime tower, `--align-to-y-axis`.
-- Build (deps rebuild) és CLI-teszt; az upstream `tests/cli` ctest a BBL profilok hiánya miatt nem fut.
-- Opcionális: rebase a friss `upstream/main`-re (+2 commit, `de3af0b7de`).
+## Második kör (2026-10-14)
+
+- `parallel-gcode-export`: klón = writer-offset (IMEX shift), IMEX állapot, toolchange_count, #16050 precompute,
+  chunk-seed az overhang estimatorhoz (a régi +18% időbecslés-eltérés oka), belt → soros; build-javítás
+  (`AdaptivePAProcessor` új konstruktora).
+- `arrange-fast`: belt → nest; excluded/nonprefered régiók akadályként; túlcsorduló plate-ek virtuális régiói;
+  feltételes prime tower; align-to-y; build-javítás (Clipper2: `jtSquare`).
+- Build: `build_linux.sh -x -c -d -s -j 20` (deps + app, 28 perc), sikeres.
+- Tesztek (új vs régi bináris, Ratrig V-Core 4 IDEX 500 0.4, 0.20mm Normal):
+  - referencia (ABS, Benchy x100): 98 + 2 plate; serial = --parallel (±1 s); régi --parallel +18% volt.
+  - többszínű (ABS/PETG): 120,5 → 98 | 22+5 toronnyal, szeletelés warning/ütközés nélkül, serial = parallel;
+    200,200 → 5 plate, 1 torony; --allow-multicolor-oneplate=0 → nest fallback.
+  - resolver: user process preset `type` nélkül, inherits 4 szint → régi = új (1 eltérés: upstream vektorrá
+    alakított `top_solid_infill_flow_ratio`).
+  - slicedata export/load (ABS → PETG) = teljes PETG szeletelés; --gcode-stats OK; thumbnail és .moves OK.
+- Döntések: upstream `tests/cli` – nem foglalkozunk vele; ebben a hónapban nincs újabb rebase (`008ee792f6` marad).

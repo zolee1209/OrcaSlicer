@@ -17,7 +17,7 @@
 #
 # Döntések: 2026-10-13 (lásd a decision mezőket).
 # Állapot: 2026-10-13, ág custom/rebased-2026-10 (upstream 008ee792f6 + fork). Kódcímkék csak a
-# cli-preset-resolver funkciónál vannak elhelyezve. Build és teszt még NINCS.
+# cli-preset-resolver és parallel-gcode-export funkciónál vannak elhelyezve. Build + CLI-teszt: 2026-10-14.
 
 # Szinkron-beállítások – a fork/tools scriptek olvassák.
 sync:
@@ -155,13 +155,18 @@ features:
     hooks: [src/libslic3r/Arrange.cpp, src/libslic3r/Arrange.hpp, src/libslic3r/CMakeLists.txt, src/OrcaSlicer.cpp, src/libslic3r/PrintConfig.cpp]
     cli: [--arrange-mode, --arrange-info, --arrange-info-format, --arrange-info-file]
     config: [arrange_mode (CLIMisc, alapértelmezés "fast"), arrange_info (CLIActions), arrange_info_format, arrange_info_file]
-    commits: [477f05313c]
+    commits: [477f05313c, b12e992347]
     used_by: null
     test: null
     notes: >
       Az alapértelmezett CLI mód "fast" → az upstream CLI arrange viselkedése nálunk eltér.
-      Nyitott: upstream is_belt (#14394), prime tower foglalás (#15837), --align-to-y-axis (#15836),
-      alapból tiltott forgatás (#15033) kezelése.
+      2026-10 igazítás: belt nyomtató → nest (fallback); excluded/nonprefered régiók akadályként minden
+      plate-en (korábban nest-fallback); túlcsorduló plate-ek megkapják az első plate virtuális régióit;
+      prime tower: ha egy plate többanyagúvá válik és nincs rajta torony, a tower-sablon (a plate saját tornya, különben az első)
+      lefoglalódik, ha nem ütközik; --align-to-y-axis: forgatásnál a 0° az elsődleges, 90° csak tartalék;
+      #15033 (forgatás csak --allow-rotations-zel) az allow_rotations paraméteren át érvényes.
+      A prime tower feltételes akadály: a CLI (#15837) minden plate-re ad tornyot, ha bármelyik többanyagú,
+      de egyanyagú plate-en nincs torony → ott nem foglal helyet (pl. A x120 + B x5: 98 + 22/5 tornnyal, korábban 97 + 23/5).
 
   # ---------------------------------------------------------------- G-code / export
 
@@ -180,7 +185,7 @@ features:
     hooks: [src/libslic3r/GCode.cpp, src/libslic3r/GCode.hpp, src/libslic3r/GCodeWriter.hpp, src/libslic3r/Print.cpp, src/libslic3r/Print.hpp, src/libslic3r/PrintConfig.cpp, src/OrcaSlicer.cpp]
     cli: [--parallel]
     config: [parallel (CLIMisc)]
-    commits: ["5442021239", 477f05313c]
+    commits: ["5442021239", 477f05313c, 22d8bb68d0]
     decision: "2026-10-13: a saját megoldás marad."
     used_by: [routes/api_routes.py run_machine_process (--parallel)]
     test: null
@@ -188,8 +193,15 @@ features:
       Rebase-szabály: a saját implementáció marad; az upstream export-változásaihoz igazítani kell.
       Legnagyobb rebase-kockázat (GCode::clone_for_parallel_chunk az upstream export-állapotát másolja).
       A 4d976bac18 a tálca-offset javítást tartalmazza a klónban.
-      Upstream azóta: export 4–26% gyorsítás (#16026, #16028, #16031, #16050, #16108, #16167),
-      IMEX offset (set_gcode_offset_with_imex_shift), iXex (#13086) – a klónnak ezeket is át kell vennie.
+      2026-10 igazítás: a klón a fő worker writer-offsetjét kapja (plate origin + IMEX shift),
+      átveszi az IMEX parallel mode / head-filament map állapotot, toolchange_count >= 1;
+      #16050 overhang precompute rétegenként a chunkban; a chunk első rétege előtt az estimator
+      az objektumok alsó rétegével előkészül (különben az első réteg teljes egészében overhangnak
+      számított → F1500, ez okozta a korábbi kb. +18% időbecslés-eltérést); belt nyomtató → soros út.
+      Az upstream többi export-gyorsítása (#16026, #16028, #16031, #16108, #16167) a közös kódúton automatikusan érvényes.
+      Mérés 2026-10-13 (referencia: Benchy x100, plate 1 = 98 db): serial vs --parallel becsült idő ±1 s
+      (korábban +18%); G-code fázis 57,0 s → 53,4 s. A nyereség kicsi, mert a kimeneti stream
+      GCodeProcessor-a (időbecslés + .moves) egyszálú, és a serial pipeline ezt már átfedi a generálással.
 
   - id: slicedata-cache
     name: --export-slicedata / --load-slicedata bináris, párhuzamos (de)szerializáció
@@ -279,7 +291,7 @@ features:
       keep_upstream: a telepített rendszer ezeket a Ratrig mellett betölti, a PresetBundle az
       OrcaFilamentLibrary-t alapkönyvtárként kezeli; rebase-nél az upstream változásai ütközés nélkül átjönnek.
       A 2026-10-es szinkronnál a 6530053928 törölte a maradékot (4750 fájl, 61 gyártó).
-      Mellékhatás: az upstream tests/cli tesztjei (cli_* ctest) a resources/profiles/BBL-t használják, ezért a forkban nem futnak.
+      Az upstream tests/cli tesztjei (cli_* ctest) a resources/profiles/BBL-t használják; döntés 2026-10-13: nem foglalkozunk velük.
 
   - id: profiles-ratrig
     name: Ratrig profilrendszer – fúvóka-variánsok, IDEX COPY/MIRROR mód, filament-kalibráció, egyedi setting_id-k
