@@ -550,6 +550,13 @@ protected:
         std::vector<size_t>  label_objects_ids;
         bool                 silent_time_estimator_enabled;
         unsigned int         layer_count;
+        // FORK(parallel-gcode-export) BEGIN: export state the upstream preamble sets up since 2026-10
+        Vec2f                writer_xy_offset;       // plate origin + IMEX slice shift (set_gcode_offset_with_imex_shift)
+        std::string          imex_parallel_mode;
+        std::map<int, int>   imex_head_filament_map;
+        unsigned int         toolchange_count;
+        bool                 overhang_fan;           // overhang_fan_enabled() for the #16050 precompute
+        // FORK(parallel-gcode-export) END
     };
     // Builds an independent GCode worker that resumes mid-print at a chunk's first layer, for
     // process_layers_parallel(). Redoes only the cheap, per-worker setup (config, extruders,

@@ -4635,7 +4635,10 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
             const bool use_parallel_chunked_export = m_parallel_export_requested
                 && print.config().print_sequence != PrintSequence::ByObject
                 && print.calib_mode() == CalibMode::Calib_None
-                && !m_spiral_vase && !m_pressure_equalizer;
+                && !m_spiral_vase && !m_pressure_equalizer
+                // FORK(parallel-gcode-export): belt printers use BeltGCode (virtual hooks, axis
+                // remap); the chunk clones are plain GCode, so belt prints stay serial.
+                && !print.config().belt_printer.value;
             if (use_parallel_chunked_export)
                 this->process_layers_parallel(print, tool_ordering, print_object_instances_ordering, layers_to_print, file);
             else
@@ -5228,8 +5231,16 @@ std::unique_ptr<GCode> GCode::clone_for_parallel_chunk(
 
     // Same writer setup as do_export() does for the main worker: without the plate offset every
     // chunk of a plate other than the first one is emitted shifted by the plate origin.
-    clone->m_writer.set_xy_offset(print.get_plate_origin()(0), print.get_plate_origin()(1));
+    // FORK(parallel-gcode-export): the main worker's offset also carries the IMEX slice shift.
+    clone->m_writer.set_xy_offset(shared.writer_xy_offset.x(), shared.writer_xy_offset.y());
     clone->m_writer.set_is_bbl_machine(print.is_BBL_printer());
+    // FORK(parallel-gcode-export) BEGIN: IMEX parallel-mode state used by tool changes / PA per layer.
+    // A chunk never starts with the print's first tool change, so the count is at least 1: the
+    // "first tool change" special cases (IMEX bare T<n>, manual filament change) must not repeat.
+    clone->m_imex_parallel_mode     = shared.imex_parallel_mode;
+    clone->m_imex_head_filament_map = shared.imex_head_filament_map;
+    clone->m_toolchange_count       = std::max(1u, shared.toolchange_count);
+    // FORK(parallel-gcode-export) END
 
     clone->set_extruders(tool_ordering.all_extruders());
     clone->m_writer.init_extruder(seed_extruder_id);
@@ -5263,7 +5274,7 @@ std::unique_ptr<GCode> GCode::clone_for_parallel_chunk(
     clone->m_cooling_buffer = make_unique<CoolingBuffer>(*clone);
     clone->m_cooling_buffer->set_current_extruder(seed_extruder_id, clone->get_extruder_id(seed_extruder_id));
 
-    clone->m_pa_processor = std::make_unique<AdaptivePAProcessor>(*clone, tool_ordering.all_extruders());
+    clone->m_pa_processor = std::make_unique<AdaptivePAProcessor>(*clone);
 
     if (clone->m_config.small_area_infill_flow_compensation.value && !clone->m_config.small_area_infill_flow_compensation_model.empty())
         clone->m_small_area_infill_flow_compensator = make_unique<SmallAreaInfillFlowCompensator>(print.config());
@@ -5357,7 +5368,10 @@ void GCode::process_layers_parallel(
     const ParallelChunkSharedState shared_state{
         m_placeholder_parser_integration.parser, m_calib_config, m_origin,
         m_enable_cooling_markers, m_enable_exclude_object, m_label_objects_ids,
-        m_silent_time_estimator_enabled, m_layer_count};
+        m_silent_time_estimator_enabled, m_layer_count,
+        // FORK(parallel-gcode-export)
+        m_writer.get_xy_offset(), m_imex_parallel_mode, m_imex_head_filament_map, m_toolchange_count,
+        overhang_fan_enabled(print.config(), m_enable_cooling_markers)};
 
     // Build every non-chunk-0 worker serially, *before* launching the parallel region below.
     // clone_for_parallel_chunk() calls SeamPlacer::init(), which itself runs a tbb::parallel_for
@@ -5383,12 +5397,23 @@ void GCode::process_layers_parallel(
         GCode *worker = (c == 0) ? this : chunk_workers[c].get();
 
         std::string &out = chunk_text[c];
+        // FORK(parallel-gcode-export) BEGIN: a fresh estimator has no previous layer, so the chunk's
+        // first layer would lose its overhang/curled-edge data. Seed it with each object's lower layer,
+        // which is what the serial pipeline prepared last in the common case.
+        if (c > 0)
+            for (const LayerToPrint &ltp : layers_to_print[begin].second)
+                if (ltp.object_layer != nullptr && ltp.object_layer->lower_layer != nullptr)
+                    worker->m_extrusion_quality_estimator.prepare_for_new_layer(ltp.original_object, ltp.object_layer->lower_layer);
+        // FORK(parallel-gcode-export) END
         for (size_t i = begin; i < end; ++i) {
             const auto       &layer_pair  = layers_to_print[i];
             const LayerTools  &layer_tools = tool_ordering.tools_for_layer(layer_pair.first);
             if (worker->m_wipe_tower && layer_tools.has_wipe_tower)
                 worker->m_wipe_tower->next_layer();
             print.throw_if_canceled();
+            // FORK(parallel-gcode-export): upstream #16050 data path (shared lower-layer trees).
+            worker->m_extrusion_quality_estimator.set_precomputed_layers(
+                precompute_overhang_layers(layer_pair.second, shared_state.overhang_fan));
             // Layers finish out of global order across chunks, so this can't report "layer N of M"
             // the way the serial path does; it reports how many of the n_layers are done so far,
             // which is enough to keep the GUI progress bar/percentage moving.
@@ -5416,6 +5441,8 @@ void GCode::process_layers_parallel(
                 cooled = worker->m_pa_processor->process_layer(std::move(cooled));
             out += cooled;
         }
+        // FORK(parallel-gcode-export): the precomputed data points into this print's layers.
+        worker->m_extrusion_quality_estimator.set_precomputed_layers({});
     });
 
     for (size_t c = 0; c < n_real_chunks; ++c)
