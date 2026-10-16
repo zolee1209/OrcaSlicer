@@ -5334,7 +5334,9 @@ std::unique_ptr<GCode> GCode::clone_for_parallel_chunk(
 
 // ORCA: --parallel. Splits layers_to_print into contiguous chunks, generated concurrently by
 // independent GCode workers (chunk 0 reuses *this; later chunks use clone_for_parallel_chunk()),
-// then writes the resulting text to output_stream in the original layer order. Falls back to the
+// and streams the resulting text to output_stream in the original layer order as soon as each chunk
+// and all its predecessors are done (FORK(parallel-gcode-export): ordered pipeline, several chunk
+// "waves" so the G-code processor overlaps the generation). Falls back to the
 // normal serial process_layers() whenever there isn't enough work to usefully split, or the
 // filters used here (cooling buffer + fan mover + adaptive PA) don't cover the active pipeline
 // (spiral vase / pressure equalizer are excluded by the caller).
@@ -5360,13 +5362,26 @@ void GCode::process_layers_parallel(
     // clone_for_parallel_chunk()), so a small minimum layer count per chunk is enough to make
     // splitting worthwhile; this matters most for prints with few layers but many objects/islands
     // per layer, where per-layer g-code text generation can still dominate slicing time.
-    const size_t       n_chunks   = std::min<size_t>(hw_threads, std::max<size_t>(1, n_layers / 4));
+    const size_t       n_chunks_one_wave = std::min<size_t>(hw_threads, std::max<size_t>(1, n_layers / 4));
 
-    if (n_chunks <= 1 || n_layers <= min_first_chunk_layers) {
+    if (n_chunks_one_wave <= 1 || n_layers <= min_first_chunk_layers) {
         // Not enough layers to usefully split: normal serial path.
         this->process_layers(print, tool_ordering, print_object_instances_ordering, layers_to_print, output_stream);
         return;
     }
+
+    // FORK(parallel-gcode-export) BEGIN: chunks are generated in "waves" of hw_threads and streamed
+    // to the G-code processor in order (see the pipeline below). With one wave every chunk finishes
+    // at about the same time and the single-threaded processor only starts afterwards; with K waves
+    // it starts after ~1/K of the generation time. More waves = more chunk boundaries.
+    // ORCA_PARALLEL_WAVES overrides the default (1 = the original one-wave layout).
+    size_t waves = 3;
+    if (const char *env = std::getenv("ORCA_PARALLEL_WAVES"); env != nullptr && *env != 0)
+        waves = size_t(std::clamp(std::atoi(env), 1, 64));
+    const size_t min_chunk_layers = 2;
+    const size_t n_chunks = std::max<size_t>(n_chunks_one_wave,
+        std::min<size_t>(n_chunks_one_wave * waves, (n_layers - min_first_chunk_layers) / min_chunk_layers));
+    // FORK(parallel-gcode-export) END
 
     // Contiguous [begin, end) layer-index ranges, chunk 0 first (>= min_first_chunk_layers long).
     std::vector<std::pair<size_t, size_t>> ranges;
@@ -5395,11 +5410,6 @@ void GCode::process_layers_parallel(
         wipe_tower_prefix[i + 1] = wipe_tower_prefix[i]
             + (tool_ordering.tools_for_layer(layers_to_print[i].first).has_wipe_tower ? 1 : 0);
 
-    // Progress reporting: layers finish concurrently and out of global order across chunks, so
-    // this counts "how many of n_layers are done", not "which specific layer index" (see below).
-    std::atomic<size_t> layers_done{0};
-
-    std::vector<std::string>            chunk_text(n_real_chunks);
     std::vector<std::unique_ptr<GCode>> chunk_workers(n_real_chunks);
     const bool has_wipe_tower_for_print = tool_ordering.has_wipe_tower();
 
@@ -5420,6 +5430,7 @@ void GCode::process_layers_parallel(
     // never audited for hidden per-object memoization caches, so running several of them
     // concurrently is not provably race-free. Doing this construction serially removes that risk;
     // only the actual per-layer text generation below (the expensive part) runs concurrently.
+    ForkPerfScope perf_clones("parallel: build chunk workers"); // FORK(perf-phase-timers)
     for (size_t c = 1; c < n_real_chunks; ++c) {
         const size_t begin = ranges[c].first;
         const LayerTools  &first_layer_tools = tool_ordering.tools_for_layer(layers_to_print[begin].first);
@@ -5432,33 +5443,40 @@ void GCode::process_layers_parallel(
         print.throw_if_canceled();
     }
 
-    tbb::parallel_for(size_t(0), n_real_chunks, [&](size_t c) {
+    // FORK(perf-phase-timers) BEGIN
+    perf_clones.stop();
+    BOOST_LOG_TRIVIAL(info) << "[fork-perf] parallel: " << n_real_chunks << " chunks, " << waves << " waves, "
+                            << n_layers << " layers";
+    ForkPerfScope             perf_pipeline("parallel: pipeline (generation + write + GCodeProcessor)");
+    double                    perf_output_ms = 0.;
+    ForkPerfClock::time_point perf_last_chunk_generated = ForkPerfClock::now();
+    // FORK(perf-phase-timers) END
+
+    // FORK(parallel-gcode-export) BEGIN: ordered pipeline -- chunks are generated concurrently and
+    // written (i.e. run through the G-code processor) strictly in layer order as soon as each one and
+    // all its predecessors are done. The token limit bounds how many finished chunk texts may wait
+    // for the writer, which also bounds peak memory.
+    auto generate_chunk = [&](size_t c) -> std::string {
         const size_t begin = ranges[c].first, end = ranges[c].second;
         GCode *worker = (c == 0) ? this : chunk_workers[c].get();
 
-        std::string &out = chunk_text[c];
-        // FORK(parallel-gcode-export) BEGIN: a fresh estimator has no previous layer, so the chunk's
-        // first layer would lose its overhang/curled-edge data. Seed it with each object's lower layer,
-        // which is what the serial pipeline prepared last in the common case.
+        std::string out;
+        // A fresh estimator has no previous layer, so the chunk's first layer would lose its
+        // overhang/curled-edge data. Seed it with each object's lower layer, which is what the
+        // serial pipeline prepared last in the common case.
         if (c > 0)
             for (const LayerToPrint &ltp : layers_to_print[begin].second)
                 if (ltp.object_layer != nullptr && ltp.object_layer->lower_layer != nullptr)
                     worker->m_extrusion_quality_estimator.prepare_for_new_layer(ltp.original_object, ltp.object_layer->lower_layer);
-        // FORK(parallel-gcode-export) END
         for (size_t i = begin; i < end; ++i) {
             const auto       &layer_pair  = layers_to_print[i];
             const LayerTools  &layer_tools = tool_ordering.tools_for_layer(layer_pair.first);
             if (worker->m_wipe_tower && layer_tools.has_wipe_tower)
                 worker->m_wipe_tower->next_layer();
             print.throw_if_canceled();
-            // FORK(parallel-gcode-export): upstream #16050 data path (shared lower-layer trees).
+            // Upstream #16050 data path (shared lower-layer trees).
             worker->m_extrusion_quality_estimator.set_precomputed_layers(
                 precompute_overhang_layers(layer_pair.second, shared_state.overhang_fan));
-            // Layers finish out of global order across chunks, so this can't report "layer N of M"
-            // the way the serial path does; it reports how many of the n_layers are done so far,
-            // which is enough to keep the GUI progress bar/percentage moving.
-            const size_t done = ++layers_done;
-            print.set_status(80, Slic3r::format(_(L("Generating G-code: layer %1%")), std::to_string(done)));
             const bool last_layer_overall = (i + 1 == n_layers);
             LayerResult lr = worker->process_layer(print, layer_pair.second, layer_tools, last_layer_overall,
                 &print_object_instances_ordering, tool_ordering.get_most_used_extruder(), size_t(-1));
@@ -5481,12 +5499,55 @@ void GCode::process_layers_parallel(
                 cooled = worker->m_pa_processor->process_layer(std::move(cooled));
             out += cooled;
         }
-        // FORK(parallel-gcode-export): the precomputed data points into this print's layers.
+        // The precomputed data points into this print's layers.
         worker->m_extrusion_quality_estimator.set_precomputed_layers({});
-    });
+        return out;
+    };
 
-    for (size_t c = 0; c < n_real_chunks; ++c)
-        output_stream.write(chunk_text[c]);
+    struct ChunkText
+    {
+        size_t      index { 0 };
+        std::string text;
+    };
+    size_t next_chunk     = 0;
+    size_t layers_written = 0;
+    const size_t max_tokens = std::max<size_t>(2, 2 * size_t(hw_threads));
+    tbb::parallel_pipeline(max_tokens,
+        tbb::make_filter<void, size_t>(slic3r_tbb_filtermode::serial_in_order,
+            [&next_chunk, n_real_chunks](tbb::flow_control &fc) -> size_t {
+                if (next_chunk >= n_real_chunks) {
+                    fc.stop();
+                    return 0;
+                }
+                return next_chunk++;
+            }) &
+        tbb::make_filter<size_t, ChunkText>(slic3r_tbb_filtermode::parallel,
+            [&generate_chunk, &chunk_workers, &perf_last_chunk_generated, n_real_chunks](size_t c) -> ChunkText {
+                ChunkText chunk { c, generate_chunk(c) };
+                // The worker is done; only the last one is needed afterwards (tail resync below).
+                if (c != 0 && c + 1 != n_real_chunks)
+                    chunk_workers[c].reset();
+                if (c + 1 == n_real_chunks)
+                    perf_last_chunk_generated = ForkPerfClock::now(); // FORK(perf-phase-timers)
+                return chunk;
+            }) &
+        tbb::make_filter<ChunkText, void>(slic3r_tbb_filtermode::serial_in_order,
+            [&](ChunkText chunk) {
+                const ForkPerfClock::time_point perf_t0 = ForkPerfClock::now(); // FORK(perf-phase-timers)
+                output_stream.write(chunk.text);
+                perf_output_ms += fork_perf_ms_since(perf_t0); // FORK(perf-phase-timers)
+                // Reported once the chunk has also been through the G-code processor, so the last
+                // layer number appears when the whole layer loop is really done.
+                layers_written += ranges[chunk.index].second - ranges[chunk.index].first;
+                print.set_status(80, Slic3r::format(_(L("Generating G-code: layer %1%")), std::to_string(layers_written)));
+            }));
+    // FORK(parallel-gcode-export) END
+
+    // FORK(perf-phase-timers) BEGIN
+    perf_pipeline.stop();
+    fork_perf_log("parallel: output stage (write + GCodeProcessor) sum", perf_output_ms);
+    fork_perf_log("parallel: tail after last chunk generated", fork_perf_ms_since(perf_last_chunk_generated));
+    // FORK(perf-phase-timers) END
 
     // Resynchronize *this (used for chunk 0) with the true tail state, so any code that runs
     // after this call (e.g. machine_end_gcode's placeholder context) sees the real last tool/

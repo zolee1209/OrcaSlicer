@@ -185,6 +185,7 @@ features:
     hooks: [src/libslic3r/GCode.cpp, src/libslic3r/GCode.hpp, src/libslic3r/GCodeWriter.hpp, src/libslic3r/Print.cpp, src/libslic3r/Print.hpp, src/libslic3r/PrintConfig.cpp, src/OrcaSlicer.cpp]
     cli: [--parallel]
     config: [parallel (CLIMisc)]
+    env: [ORCA_PARALLEL_WAVES]
     commits: ["5442021239", 477f05313c, 22d8bb68d0]
     decision: "2026-10-13: a saját megoldás marad."
     used_by: [routes/api_routes.py run_machine_process (--parallel)]
@@ -202,6 +203,12 @@ features:
       Mérés 2026-10-13 (referencia: Benchy x100, plate 1 = 98 db): serial vs --parallel becsült idő ±1 s
       (korábban +18%); G-code fázis 57,0 s → 53,4 s. A nyereség kicsi, mert a kimeneti stream
       GCodeProcessor-a (időbecslés + .moves) egyszálú, és a serial pipeline ezt már átfedi a generálással.
+      2026-10-16 profil (nyitott javítási lehetőségek): fork/perf/2026-10-16-gcode-phase-profile.md.
+      2026-10-16 rendezett pipeline: a chunkok K hullámban (szálak × K chunk, min. 2 réteg) készülnek
+      tbb::parallel_pipeline-ban, és sorrendben, azonnal mennek a GCodeProcessorba (átfedés a generálással);
+      a progress a kiírásból jön (nincs néma farok az utolsó réteg után); a kész klónok azonnal felszabadulnak.
+      ORCA_PARALLEL_WAVES (alap 3; 1 = a régi egyhullámú elrendezés). Teszt: Benchy x100 becsült idő
+      soros +3 s / 2 nap 10 óra; többszínű IDEX (Benchy x120 ABS + 1.stl x5 PETG) T0/T1 és torony azonos, +2 s.
 
   - id: slicedata-cache
     name: --export-slicedata / --load-slicedata bináris, párhuzamos (de)szerializáció
