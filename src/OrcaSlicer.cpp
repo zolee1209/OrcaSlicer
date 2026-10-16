@@ -6797,6 +6797,13 @@ int CLI::run(int argc, char **argv)
         }
 #endif
         glfwSetErrorCallback(glfw_callback);
+#if defined(__linux__) || defined(__LINUX__)
+        // FORK(cli-thumbnail-gl) BEGIN: the thumbnail window is invisible, so it needs no decorations.
+        // libdecor's GTK plugin calls gtk_init(), which aborts the process (GLib-GIO-ERROR) when the
+        // environment points to a mismatched GSettings schema (e.g. launched from a snap terminal).
+        glfwInitHint(GLFW_WAYLAND_LIBDECOR, GLFW_WAYLAND_DISABLE_LIBDECOR);
+        // FORK(cli-thumbnail-gl) END
+#endif
         int glfw_ret = glfwInit();
 #if defined(__linux__) || defined(__LINUX__)
         // Restore XDG_RUNTIME_DIR after init so rest of program is unaffected
