@@ -1,4 +1,13 @@
 #include "libslic3r/libslic3r.h"
+#include "libslic3r/ForkPerfTimer.hpp" // FORK(perf-phase-timers)
+
+// FORK(perf-phase-timers) BEGIN: the first toolpath render after a load (lazy colour / visibility
+// buffer updates happen there). GUI thread only.
+namespace {
+bool                              s_fork_perf_first_render_pending = false;
+Slic3r::ForkPerfClock::time_point s_fork_perf_load_end;
+} // namespace
+// FORK(perf-phase-timers) END
 #include "GCodeViewer.hpp"
 
 #include "libslic3r/BuildVolume.hpp"
@@ -1436,6 +1445,7 @@ void GCodeViewer::load_as_gcode(const GCodeProcessorResult& gcode_result, const 
 
     //BBS: add logs
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": gcode result %1%, new id %2%, gcode file %3% ") % (&gcode_result) % m_last_result_id % gcode_result.filename;
+    ForkPerfScope perf_total("preview: GCodeViewer::load_as_gcode total"); // FORK(perf-phase-timers)
 
     // release gpu memory, if used
     reset();
@@ -1560,8 +1570,10 @@ void GCodeViewer::load_as_gcode(const GCodeProcessorResult& gcode_result, const 
             belt_inv = Transform3d(Eigen::Translation3d(d)) * belt_inv;
         }
     }
+    ForkPerfClock::time_point perf_t0 = ForkPerfClock::now(); // FORK(perf-phase-timers)
     libvgcode::GCodeInputData data = libvgcode::convert(gcode_result, str_tool_colors, str_color_print_colors, m_viewer,
         apply_belt ? &belt_inv : nullptr);
+    fork_perf_log("preview: libvgcode::convert", fork_perf_ms_since(perf_t0)); // FORK(perf-phase-timers)
 
 //#define ENABLE_DATA_EXPORT 1
 //#if ENABLE_DATA_EXPORT
@@ -1657,7 +1669,12 @@ void GCodeViewer::load_as_gcode(const GCodeProcessorResult& gcode_result, const 
 
     // send data to the viewer
     m_viewer.reset_default_extrusion_roles_colors();
+    // FORK(perf-phase-timers) BEGIN
+    perf_t0 = ForkPerfClock::now();
     m_viewer.load(std::move(data));
+    fork_perf_log("preview: libvgcode Viewer::load (incl. GPU upload)", fork_perf_ms_since(perf_t0));
+    perf_t0 = ForkPerfClock::now();
+    // FORK(perf-phase-timers) END
 
     // Belt printers: libvgcode labels a layer with the height of its toolpaths, which
     // on a tilted layer is wherever its last extrusion happened to end, and the layer
@@ -1726,6 +1743,10 @@ void GCodeViewer::load_as_gcode(const GCodeProcessorResult& gcode_result, const 
     }
 
     m_extruders_count = gcode_result.filaments_count;
+    // FORK(perf-phase-timers) BEGIN
+    fork_perf_log("preview: bounding box + bed containment", fork_perf_ms_since(perf_t0));
+    perf_t0 = ForkPerfClock::now();
+    // FORK(perf-phase-timers) END
 
     //BBS: move the id to the end of reset
     m_last_result_id = gcode_result.id;
@@ -1751,8 +1772,14 @@ void GCodeViewer::load_as_gcode(const GCodeProcessorResult& gcode_result, const 
         }
     }
     m_only_gcode_in_preview = only_gcode;
-
+    // FORK(perf-phase-timers) BEGIN
+    fork_perf_log("preview: move type statistics", fork_perf_ms_since(perf_t0));
+    perf_t0 = ForkPerfClock::now();
     m_sequential_view.gcode_window.load_gcode(gcode_result.filename, gcode_result.lines_ends);
+    fork_perf_log("preview: gcode_window.load_gcode", fork_perf_ms_since(perf_t0));
+    s_fork_perf_first_render_pending = true;
+    s_fork_perf_load_end             = ForkPerfClock::now();
+    // FORK(perf-phase-timers) END
 
     //BBS: add only gcode mode
     //if (wxGetApp().is_gcode_viewer())
@@ -3250,6 +3277,15 @@ void GCodeViewer::render_toolpaths()
     m_viewer.set_cog_marker_scale_factor(m_cog_marker_fixed_screen_size ? 10.0f * m_cog_marker_size * camera.get_inv_zoom() : m_cog_marker_size);
     m_viewer.set_tool_marker_scale_factor(m_tool_marker_fixed_screen_size ? 10.0f * m_tool_marker_size * camera.get_inv_zoom() : m_tool_marker_size);
 #endif // VGCODE_ENABLE_COG_AND_TOOL_MARKERS
+    // FORK(perf-phase-timers) BEGIN
+    if (s_fork_perf_first_render_pending) {
+        s_fork_perf_first_render_pending = false;
+        fork_perf_log("preview: load end -> first toolpath render start", fork_perf_ms_since(s_fork_perf_load_end));
+        const ForkPerfClock::time_point perf_t0 = ForkPerfClock::now();
+        m_viewer.render(converted_view_matrix, converted_projetion_matrix);
+        fork_perf_log("preview: first libvgcode Viewer::render", fork_perf_ms_since(perf_t0));
+    } else
+    // FORK(perf-phase-timers) END
     m_viewer.render(converted_view_matrix, converted_projetion_matrix);
 
 #if ENABLE_NEW_GCODE_VIEWER_DEBUG

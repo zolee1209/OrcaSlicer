@@ -4,6 +4,7 @@
 #include "CalibUtils.hpp"
 #include "Flashforge.hpp"
 #include "libslic3r/Config.hpp"
+#include "libslic3r/ForkPerfTimer.hpp" // FORK(perf-phase-timers)
 #include "libslic3r_version.h"
 
 #include <boost/assert/source_location.hpp>
@@ -13264,6 +13265,7 @@ void Plater::priv::on_process_completed(SlicingProcessCompletedEvent &evt)
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": ignore this event %1%") % evt.status();
         return;
     }
+    ForkPerfScope perf_total("gui: Plater on_process_completed total"); // FORK(perf-phase-timers)
     //BBS: add project slice logic
     bool is_finished = !m_slice_all || (m_cur_slice_plate == (partplate_list.get_plate_count() - 1));
 

@@ -6,6 +6,7 @@
 #include "libslic3r/CommonDefs.hpp"
 #include "ExtrusionEntity.hpp"
 #include "libslic3r/GCodeReader.hpp"
+#include "libslic3r/ForkPerfTimer.hpp" // FORK(perf-phase-timers)
 #include "GCodeWriter.hpp"
 #include "libslic3r/Point.hpp"
 #include "libslic3r/PrintBase.hpp"
@@ -3884,13 +3885,20 @@ void GCodeProcessor::finalize(bool post_process)
     m_result.initial_layer_time = get_first_layer_time(PrintEstimatedStatistics::ETimeMode::Normal);
 
     if (post_process){
-        run_post_process();
+        // FORK(perf-phase-timers) BEGIN
+        {
+            ForkPerfScope perf_post("export: finalize: run_post_process");
+            run_post_process();
+        }
+        // FORK(perf-phase-timers) END
         // Additive pre-heat/pre-cool injection second pass. Gated on m_enable_pre_heating so the
         // byte-frozen fleet (X1/P1/A1/H2S) never enters it. When the injector produces no lines the
         // InsertedLinesMap is empty, so this is a byte-for-byte identity rewrite; it exercises the
         // merge/offset machinery on the multi-nozzle fleet (H2D/X2D/H2D-Pro/H2C).
-        if (m_enable_pre_heating)
+        if (m_enable_pre_heating) {
+            ForkPerfScope perf_second("export: finalize: run_second_pass_injection"); // FORK(perf-phase-timers)
             run_second_pass_injection();
+        }
     }
     //BBS: update slice warning
     update_slice_warnings();

@@ -111,6 +111,7 @@
 #include "calib.hpp"
 #include "libslic3r_version.h"
 #include "GCode/BeltKinematics.hpp"
+#include "ForkPerfTimer.hpp" // FORK(perf-phase-timers)
 // Intel redesigned some TBB interface considerably when merging TBB with their oneAPI set of libraries, see GH #7332.
 // We are using quite an old TBB 2017 U7. Before we update our build servers, let's use the old API, which is deprecated in up to date TBB.
 #if ! defined(TBB_VERSION_MAJOR)
@@ -2744,6 +2745,7 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
         return;
 
     BOOST_LOG_TRIVIAL(info) << boost::format("Will export G-code to %1% soon")%path;
+    ForkPerfScope perf_do_export("export: do_export total"); // FORK(perf-phase-timers)
 
     GCodeProcessor::s_IsBBLPrinter = print->is_BBL_printer();
     m_writer.set_is_bbl_machine(print->is_BBL_printer());
@@ -2817,7 +2819,12 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
     }
 
     try {
-        this->_do_export(*print, file, thumbnail_cb);
+        // FORK(perf-phase-timers) BEGIN
+        {
+            ForkPerfScope perf_body("export: _do_export (generation + GCodeProcessor stream)");
+            this->_do_export(*print, file, thumbnail_cb);
+        }
+        // FORK(perf-phase-timers) END
         file.flush();
         if (file.is_error()) {
             file.close();
@@ -2915,7 +2922,12 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
     // single-nozzle prints, where the injector is gated off anyway (enable_pre_heating false).
     m_processor.result().nozzle_group_result = m_print->get_layered_nozzle_group_result();
 
-    m_processor.finalize(true);
+    // FORK(perf-phase-timers) BEGIN
+    {
+        ForkPerfScope perf_finalize("export: GCodeProcessor::finalize");
+        m_processor.finalize(true);
+    }
+    // FORK(perf-phase-timers) END
 //    DoExport::update_print_estimated_times_stats(m_processor, print->m_print_statistics);
     DoExport::update_print_estimated_stats(m_processor, m_writer.extruders(), print->m_print_statistics, print->config());
     // Printed-mass safety check. Flushed filament leaves the bed, so subtract it
@@ -2937,9 +2949,12 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
     // explicitly skipped (e.g. price-calculation-only CLI runs that never build
     // a render bundle and don't need it -- writing tens of millions of 24-byte
     // records can cost multiple seconds of single-threaded disk I/O on HDD storage).
-    if (!std::getenv("ORCA_SKIP_MOVES_EXPORT"))
+    if (!std::getenv("ORCA_SKIP_MOVES_EXPORT")) {
+        ForkPerfScope perf_moves("export: .moves sidecar"); // FORK(perf-phase-timers)
         GCodeProcessor::export_moves_file(m_processor.get_result(), path);
+    }
     if (result != nullptr) {
+        ForkPerfScope perf_extract("export: extract_result"); // FORK(perf-phase-timers)
         *result = std::move(m_processor.extract_result());
         // set the filename to the correct value
         result->filename = path;
@@ -4341,7 +4356,12 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
 
     // Collect custom seam data from all objects.
     std::function<void(void)> throw_if_canceled_func = [&print]() { print.throw_if_canceled(); };
-    m_seam_placer->init(print, throw_if_canceled_func);
+    // FORK(perf-phase-timers) BEGIN
+    {
+        ForkPerfScope perf_seam("export: SeamPlacer::init");
+        m_seam_placer->init(print, throw_if_canceled_func);
+    }
+    // FORK(perf-phase-timers) END
     // Precise Seam: init() only prepares its warning; issue it here, inside the active export step.
     if (!m_seam_placer->precise_seam_warning().empty())
         print.active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL,
@@ -5012,12 +5032,17 @@ void GCode::process_layers(
     GCodeOutputStream                                                   &output_stream)
 {
     // The pipeline is variable: The vase mode filter is optional.
+    // FORK(perf-phase-timers) BEGIN
+    const ForkPerfClock::time_point perf_start = ForkPerfClock::now();
+    ForkPerfClock::time_point       perf_last_layer_generated = perf_start;
+    double                          perf_output_ms = 0.;
+    // FORK(perf-phase-timers) END
     size_t layer_to_print_idx = 0;
     const auto source = precomputed_layers_source(layer_to_print_idx, layers_to_print.size(), m_pressure_equalizer != nullptr,
         overhang_fan_enabled(print.config(), m_enable_cooling_markers),
         [&layers_to_print](size_t index) -> const std::vector<LayerToPrint> & { return layers_to_print[index].second; });
     const auto generator = tbb::make_filter<PrecomputedLayer, LayerResult>(slic3r_tbb_filtermode::serial_in_order,
-        [this, &print, &tool_ordering, &print_object_instances_ordering, &layers_to_print](PrecomputedLayer precomputed) -> LayerResult {
+        [this, &print, &tool_ordering, &print_object_instances_ordering, &layers_to_print, &perf_last_layer_generated](PrecomputedLayer precomputed) -> LayerResult {
             if (precomputed.index == size_t(-1))
                 return LayerResult::make_nop_layer_result();
             const std::pair<coordf_t, std::vector<LayerToPrint>>& layer = layers_to_print[precomputed.index];
@@ -5029,7 +5054,12 @@ void GCode::process_layers(
             check_placeholder_parser_failed();
             print.throw_if_canceled();
             m_extrusion_quality_estimator.set_precomputed_layers(std::move(precomputed.overhang_layers));
-            return this->process_layer(print, layer.second, layer_tools, &layer == &layers_to_print.back(), &print_object_instances_ordering, tool_ordering.get_most_used_extruder(), size_t(-1));
+            // FORK(perf-phase-timers) BEGIN
+            LayerResult result = this->process_layer(print, layer.second, layer_tools, &layer == &layers_to_print.back(), &print_object_instances_ordering, tool_ordering.get_most_used_extruder(), size_t(-1));
+            if (&layer == &layers_to_print.back())
+                perf_last_layer_generated = ForkPerfClock::now();
+            return result;
+            // FORK(perf-phase-timers) END
         });
     if (m_spiral_vase) {
         float nozzle_diameter  = EXTRUDER_CONFIG(nozzle_diameter);
@@ -5061,9 +5091,15 @@ void GCode::process_layers(
             }
         );
     
+    // FORK(perf-phase-timers) BEGIN: the output stage is where GCodeProcessor parses the stream.
     const auto output = tbb::make_filter<std::string, void>(slic3r_tbb_filtermode::serial_in_order,
-        [&output_stream](std::string s) { output_stream.write(s); }
+        [&output_stream, &perf_output_ms](std::string s) {
+            const ForkPerfClock::time_point t0 = ForkPerfClock::now();
+            output_stream.write(s);
+            perf_output_ms += fork_perf_ms_since(t0);
+        }
     );
+    // FORK(perf-phase-timers) END
 
     const auto fan_mover = tbb::make_filter<std::string, std::string>(slic3r_tbb_filtermode::serial_in_order,
             [&fan_mover = this->m_fan_mover, &config = this->config(), &writer = this->m_writer](std::string in)->std::string {
@@ -5096,7 +5132,11 @@ void GCode::process_layers(
     	tbb::parallel_pipeline(12, source & generator & cooling & fan_mover & pa_processor_filter & output);
     // The estimator's precomputed data points into this print's layers.
     m_extrusion_quality_estimator.set_precomputed_layers({});
-
+    // FORK(perf-phase-timers) BEGIN
+    fork_perf_log("serial: process_layers total", fork_perf_ms_since(perf_start));
+    fork_perf_log("serial: output stage (write + GCodeProcessor) sum", perf_output_ms);
+    fork_perf_log("serial: tail after last layer generated", fork_perf_ms_since(perf_last_layer_generated));
+    // FORK(perf-phase-timers) END
 }
 
 // Process all layers of a single object instance (sequential mode) with a parallel pipeline:

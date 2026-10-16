@@ -231,6 +231,21 @@ features:
     commits: [df069a9438]
     test: null
 
+  - id: perf-phase-timers
+    name: Fázis-időmérők a G-code exporthoz és a GUI előnézet-betöltéshez ([fork-perf] info log)
+    status: fork-only
+    owned_files: [src/libslic3r/ForkPerfTimer.hpp]
+    hooks: [src/libslic3r/GCode.cpp, src/libslic3r/GCode/GCodeProcessor.cpp, src/slic3r/GUI/BackgroundSlicingProcess.cpp, src/slic3r/GUI/Plater.cpp, src/slic3r/GUI/GUI_Preview.cpp, src/slic3r/GUI/GCodeViewer.cpp]
+    commits: []
+    test: null
+    notes: >
+      Diagnosztika: "[fork-perf] <lépés>: <ms> ms" sorok info szinten (CLI --debug 4, GUI log_severity_level=info);
+      alacsonyabb szinten némák. Mért: SeamPlacer::init, soros pipeline (összes, output-szakasz, farok az utolsó réteg után),
+      --parallel (klónok, generálás, írás+processzor), _do_export, finalize/run_post_process, .moves, extract_result,
+      GUI export_gcode, GCodeFinalize, on_process_completed, Preview::load_print_as_fff, load_shells, load_as_gcode
+      (convert, Viewer::load, bbox, statisztika, gcode_window) és az első render. G-code kimenet nem változik.
+      Háttér: fork/perf/2026-10-16-gcode-phase-profile.md.
+
   - id: fix-mmu-unpainted
     name: ModelVolume::get_extruders – festetlen térfogatnál kimarad a TriangleSelector építés
     status: fork-only

@@ -1,6 +1,7 @@
 //#include "stdlib.h"
 #include "libslic3r/libslic3r.h"
 #include "libslic3r/Layer.hpp"
+#include "libslic3r/ForkPerfTimer.hpp" // FORK(perf-phase-timers)
 #include "IMSlider.hpp"
 #include "GUI_Preview.hpp"
 #include "GUI_App.hpp"
@@ -658,8 +659,14 @@ void Preview::load_print_as_fff(bool keep_z_range, bool only_gcode)
     // is performed on all of them(this ensures that _shifted_copies was
     // populated and we know the number of layers)
     bool has_layers = false;
+    // FORK(perf-phase-timers) BEGIN
+    ForkPerfScope perf_total("preview: Preview::load_print_as_fff total");
+    {
+        ForkPerfScope perf_shells("preview: load_shells");
     //BBS: always load shell at preview
     load_shells(*print, true);
+    }
+    // FORK(perf-phase-timers) END
     BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << boost::format(" %1%: print: %2%, gcode_result %3%, check started")%__LINE__ %print %m_gcode_result;
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(" %1%: print is step done, posSlice %2%, posSupportMaterial %3%, psGCodeExport %4%") % __LINE__ % print->is_step_done(posSlice) %print->is_step_done(posSupportMaterial) % print->is_step_done(psGCodeExport);
     if (print->is_step_done(posSlice)) {
