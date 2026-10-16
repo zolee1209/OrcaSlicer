@@ -121,14 +121,21 @@ features:
     test: null
 
   - id: cli-thumbnail-gl
-    name: Headless CLI thumbnail-renderelés (korai GL-inicializálás, X11-kényszer Wayland nélkül, wxGetApp-mentes shader-választás)
+    name: Headless CLI thumbnail-renderelés (korai GL-inicializálás, X11-kényszer Wayland nélkül, libdecor tiltása, wxGetApp-mentes shader-választás)
     status: fork-only
     hooks: [src/OrcaSlicer.cpp, src/slic3r/GUI/GLShadersManager.cpp]
     env: [XDG_RUNTIME_DIR, WAYLAND_DISPLAY]
-    commits: [cdea9ce03d, "5442021239"]
+    commits: [cdea9ce03d, "5442021239", 20d25220f9]
     upstream_equivalent: "részben: upstream GL 3.3 context + fallback a CLI thumbnailnél (2026-10)"
+    used_by: [routes/api_routes.py run_machine_process (minden --slice hívás)]
     test: null
-    notes: A 49607d49f4 javította a GL kontextus-verziót (3.2); az upstream azóta 3.3-at kér, fallbackkel.
+    notes: >
+      A 49607d49f4 javította a GL kontextus-verziót (3.2); az upstream azóta 3.3-at kér, fallbackkel.
+      2026-10-16: Wayland-munkamenetben a GLFW 3.4 libdecor-gtk pluginja gtk_init()-et hívott; snap-os
+      VS Code terminálból indított www-nél (XDG_DATA_DIRS/GSETTINGS_SCHEMA_DIR snap-sémára mutat) ez
+      GLib-GIO-ERROR abortot (-6) okozott minden szeletelésnél. Javítás: glfwInitHint(GLFW_WAYLAND_LIBDECOR,
+      GLFW_WAYLAND_DISABLE_LIBDECOR) a glfwInit előtt (FORK(cli-thumbnail-gl) blokk) – a láthatatlan
+      ablaknak nem kell dekoráció. Ág: fix/cli-thumbnail-gl-libdecor.
 
   - id: fix-partplate-model-pointer
     name: PartPlate/PartPlateList::set_model – modellmutató frissítése m_models újrafoglalás után (--assemble)
