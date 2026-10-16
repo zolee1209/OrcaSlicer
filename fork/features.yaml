@@ -186,7 +186,7 @@ features:
     cli: [--parallel]
     config: [parallel (CLIMisc)]
     env: [ORCA_PARALLEL_WAVES]
-    commits: ["5442021239", 477f05313c, 22d8bb68d0]
+    commits: ["5442021239", 477f05313c, 22d8bb68d0, 5a8a02acdc]
     decision: "2026-10-13: a saját megoldás marad."
     used_by: [routes/api_routes.py run_machine_process (--parallel)]
     test: null
@@ -243,7 +243,7 @@ features:
     status: fork-only
     owned_files: [src/libslic3r/ForkPerfTimer.hpp]
     hooks: [src/libslic3r/GCode.cpp, src/libslic3r/GCode/GCodeProcessor.cpp, src/slic3r/GUI/BackgroundSlicingProcess.cpp, src/slic3r/GUI/Plater.cpp, src/slic3r/GUI/GUI_Preview.cpp, src/slic3r/GUI/GCodeViewer.cpp]
-    commits: []
+    commits: [9356fc9956]
     test: null
     notes: >
       Diagnosztika: "[fork-perf] <lépés>: <ms> ms" sorok info szinten (CLI --debug 4, GUI log_severity_level=info);
