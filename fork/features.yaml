@@ -266,7 +266,7 @@ features:
     cli: ["--tree-support-fast-mode (generikus read_cli override, bool flag, nincs külön CLI-kód; '='-jellel is: --tree-support-fast-mode=0)"]
     config: [tree_support_fast_mode (PrintObjectConfig, GUI: Support oldal, Mode: Develop)]
     hooks: [src/libslic3r/PrintConfig.hpp, src/libslic3r/PrintConfig.cpp, src/libslic3r/PrintObject.cpp, src/libslic3r/Support/TreeSupport.cpp, src/libslic3r/Support/TreeSupport3D.cpp, src/slic3r/GUI/Tab.cpp]
-    commits: []
+    commits: [4d8a27b532]
     test: null
     notes: >
       Alap (kapcsoló ki, alapértelmezett): a kód szó szerint a mai útvonalon fut, nulla kockázat.
@@ -310,6 +310,24 @@ features:
       valószínűleg nem lock-kontencióból, hanem rétegenkénti alacsony elemszámból ered. gdb/strace alapú
       szálmintavétel nem elérhető ezen a gépen (ptrace_scope korlátozás, ugyanaz mint a perf-nél), ezért a
       pontos ok nem igazolható tovább; a changeset nincs a repóban (visszavonva bizonyított haszon nélkül).
+      Mérési szórás: fast_mode mellett a tree support 165,4 s és 172,2 s között mozgott (2 futás), a fenti
+      -20% egyetlen futásból származik; reálisan kb. -17..-20%. A teljes futásidő zaja ~±4%.
+      2026-10-17 lezárás: feature/tree-support-fast-draw ág lezárva, fast-forward beolvasztva a
+      custom/rebased-2026-10 ágba; azon az ágon további módosítás nem lesz.
+      Nyitott pont (nincs megvalósítva) — detect_overhangs maradék soros farka, ideiglenes mérőkkel mérve
+      (fast_mode, helmet referencia, a mérők visszavonva): sharp-tail lánc 0,29 s (11 seed-réteg, 52 lánc-réteg,
+      68 új tail) → nem éri meg; cluster-építés ~3,3 s (10 749 régió, 1070 cluster, ≤123 487 offset+overlap
+      próba, legnagyobb cluster 428 réteg) → egyetlen érdemi jelölt; enforcer/blocker szeletelés 0,35 s
+      enforcer/blocker nélküli modellen (oka nem vizsgált). Az azonos kimenethez megőrzendő upstream
+      viselkedés: első találat index-sorrendben, a clusterek NEM olvadnak össze (union-find NEM azonos);
+      layer_overhangs std::map emplace miatt az azonos rétegen azonos clusterbe kerülő 2. régió kimarad a
+      loverhangs-ból (valószínű upstream hiba, megőrzendő); a konstruktor első eleme offset 0-val; merged_poly
+      inkrementális union-sorrendje. Terv: (1) soros, azonos: offset_ex régiónként egyszer + rétegenként aktív
+      cluster-lista index-sorrendben; (2) párhuzamos 3 fázis: rétegenkénti precompute + L-1 szomszédság →
+      geometria nélküli soros besorolás → clusterenkénti merged_poly replay azonos sorrendben. Becsült nyereség
+      ~2,5–3 s (~1–1,3% a teljes időből), saját fájlba, a tree_support_fast_mode mögé. Ismert, nem ehhez tartozó
+      nemdeterminizmus: a párhuzamos overhang-fázisban config_detect_sharp_tails=false írás (>100 poligon/réteg
+      vagy 30 s) — összevető teszteknél a "detect_overhangs takes more than 30 secs" logsor nem szerepelhet.
 
   - id: fix-mmu-unpainted
     name: ModelVolume::get_extruders – festetlen térfogatnál kimarad a TriangleSelector építés
