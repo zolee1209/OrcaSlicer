@@ -50,6 +50,7 @@
 #include <memory>
 #include <set>
 #include <mutex>
+#include <atomic> // FORK(tree-support-fast-draw)
 #include <tbb/blocked_range.h>
 #include <tbb/concurrent_unordered_set.h>
 #include <tbb/concurrent_vector.h>
@@ -759,6 +760,11 @@ void TreeSupport::detect_overhangs(bool check_support_necessity/* = false*/)
     const bool support_critical_regions_only = config.support_critical_regions_only.value;
     bool config_remove_small_overhangs = config.support_remove_small_overhang.value;
     bool config_detect_sharp_tails = g_config_support_sharp_tails;
+    // FORK(tree-support-fast-draw): parallelize the sub-loops below that have no cross-layer /
+    // cross-cluster data dependency. The sharp-tail accumulation loop (reads the previous layer's
+    // just-computed result) and the cluster-building loop (sequential insertion into a growing
+    // list) keep their current serial form either way.
+    const bool fast_mode = config.tree_support_fast_mode.value;
     const int enforce_support_layers = config.enforce_support_layers.value;
     const double area_thresh_well_supported = SQ(scale_(6));
     const double length_thresh_well_supported = scale_(6);
@@ -1149,7 +1155,9 @@ void TreeSupport::detect_overhangs(bool check_support_necessity/* = false*/)
 
     if (is_auto(stype) && config_remove_small_overhangs) {
         // remove small overhangs
-        for (auto& cluster : overhangClusters) {
+        // FORK(tree-support-fast-draw) BEGIN: each cluster only reads/writes its own fields here,
+        // so this loop can be split across clusters without changing the result.
+        auto process_cluster = [&](OverhangCluster &cluster) {
             // 3. check whether the small overhang is sharp tail
             cluster.is_sharp_tail = false;
             for (size_t layer_id = cluster.min_layer; layer_id <= cluster.max_layer; layer_id++) {
@@ -1180,7 +1188,17 @@ void TreeSupport::detect_overhangs(bool check_support_necessity/* = false*/)
                 { cluster.merged_poly,{"overhang", "blue", 0.5} },
                 { cluster.is_cantilever? layer1->cantilevers: offset_ex(cluster.merged_poly, -1 * extrusion_width_scaled), {cluster.is_cantilever ? "cantilever":"erode1","green",0.5}} });
 #endif
-        }
+        };
+        if (fast_mode)
+            tbb::parallel_for(tbb::blocked_range<size_t>(0, overhangClusters.size()),
+                [&](const tbb::blocked_range<size_t> &range) {
+                    for (size_t i = range.begin(); i < range.end(); ++i)
+                        process_cluster(overhangClusters[i]);
+                });
+        else
+            for (auto& cluster : overhangClusters)
+                process_cluster(cluster);
+        // FORK(tree-support-fast-draw) END
     }
 
     for (auto& cluster : overhangClusters) {
@@ -1195,10 +1213,14 @@ void TreeSupport::detect_overhangs(bool check_support_necessity/* = false*/)
 
     int layers_with_overhangs = 0;
     int layers_with_enforcers = 0;
-    for (int layer_nr = 0; layer_nr < m_object->layer_count(); layer_nr++) {
-        if (m_object->print()->canceled())
-            break;
-
+    // FORK(tree-support-fast-draw) BEGIN: per layer_nr this loop only reads values already fully
+    // computed above (sharp_tails / sharp_tails_height / lslices_extrudable of the current and
+    // lower layer) and only writes into its own layer's fields, so it has no cross-layer data
+    // dependency. It does write into a handful of shared accumulators (overhang_types map,
+    // layers_with_overhangs/enforcers, has_sharp_tails, has_cantilever, m_highest_overhang_layer),
+    // so the fast path collects those locally per task and merges them once after the parallel_for.
+    auto process_overhang_layer = [&](int layer_nr, std::vector<std::pair<const ExPolygon*, OverhangType>> *out_types,
+                                       bool *out_has_sharp_tail) -> std::tuple<bool, bool, bool> {
         auto layer = m_object->get_layer(layer_nr);
         auto lower_layer = layer->lower_layer;
 
@@ -1213,7 +1235,10 @@ void TreeSupport::detect_overhangs(bool check_support_necessity/* = false*/)
                 float accum_height = layer->sharp_tails_height[i];
                 if (!areas.empty() && int(accum_height * 10) % 5 == 0) {
                     append(sharp_tail_overhangs, areas);
-                    has_sharp_tails = true;
+                    if (out_has_sharp_tail)
+                        *out_has_sharp_tail = true;
+                    else
+                        has_sharp_tails = true;
 #ifdef SUPPORT_TREE_DEBUG_TO_SVG
                     SVG::export_expolygons(debug_out_path("sharp_tail_%.02f.svg", layer->print_z), areas);
 #endif
@@ -1257,17 +1282,89 @@ void TreeSupport::detect_overhangs(bool check_support_necessity/* = false*/)
         append(layer->loverhangs, sharp_tail_overhangs);
 
         // fill overhang_types
-        for (size_t i = 0; i < layer->loverhangs.size(); i++)
-            overhang_types.emplace(&layer->loverhangs[i], i < nDetected ? OverhangType::Detected :
-                i < nEnforced ? OverhangType::Enforced : OverhangType::SharpTail);
-
-        if (!layer->loverhangs.empty()) {
-            layers_with_overhangs++;
-            m_highest_overhang_layer = std::max(m_highest_overhang_layer, size_t(layer_nr));
+        for (size_t i = 0; i < layer->loverhangs.size(); i++) {
+            OverhangType type = i < nDetected ? OverhangType::Detected :
+                i < nEnforced ? OverhangType::Enforced : OverhangType::SharpTail;
+            if (out_types)
+                out_types->emplace_back(&layer->loverhangs[i], type);
+            else
+                overhang_types.emplace(&layer->loverhangs[i], type);
         }
-        if (nEnforced > 0) layers_with_enforcers++;
-        if (!layer->cantilevers.empty()) has_cantilever = true;
+
+        return { !layer->loverhangs.empty(), nEnforced > 0, !layer->cantilevers.empty() };
+    };
+
+    if (fast_mode) {
+        std::atomic<int>    atomic_layers_with_overhangs{0};
+        std::atomic<int>    atomic_layers_with_enforcers{0};
+        std::atomic<bool>   atomic_has_cantilever{has_cantilever};
+        std::atomic<bool>   atomic_has_sharp_tails{has_sharp_tails};
+        std::atomic<size_t> atomic_highest_overhang_layer{m_highest_overhang_layer};
+        std::mutex          overhang_types_mutex;
+        tbb::parallel_for(tbb::blocked_range<int>(0, int(m_object->layer_count())),
+            [&](const tbb::blocked_range<int> &range) {
+                std::vector<std::pair<const ExPolygon*, OverhangType>> local_types;
+                int  local_overhangs = 0, local_enforcers = 0;
+                bool local_cantilever = false, local_sharp_tail = false;
+                size_t local_highest = 0;
+                bool   local_highest_set = false;
+                for (int layer_nr = range.begin(); layer_nr < range.end(); ++layer_nr) {
+                    // throw_if_canceled() is protected on PrintBase; canceled() is the public
+                    // equivalent, so replicate its body here instead of making it public.
+                    if (m_object->print()->canceled())
+                        throw CanceledException();
+                    auto [has_overhangs, has_enforcers, layer_cantilever] =
+                        process_overhang_layer(layer_nr, &local_types, &local_sharp_tail);
+                    if (has_overhangs) {
+                        ++local_overhangs;
+                        local_highest = size_t(layer_nr);
+                        local_highest_set = true;
+                    }
+                    if (has_enforcers)
+                        ++local_enforcers;
+                    if (layer_cantilever)
+                        local_cantilever = true;
+                }
+                if (local_overhangs)
+                    atomic_layers_with_overhangs += local_overhangs;
+                if (local_enforcers)
+                    atomic_layers_with_enforcers += local_enforcers;
+                if (local_cantilever)
+                    atomic_has_cantilever = true;
+                if (local_sharp_tail)
+                    atomic_has_sharp_tails = true;
+                if (local_highest_set) {
+                    size_t prev = atomic_highest_overhang_layer.load(std::memory_order_relaxed);
+                    while (local_highest > prev && !atomic_highest_overhang_layer.compare_exchange_weak(prev, local_highest))
+                        ;
+                }
+                if (!local_types.empty()) {
+                    std::lock_guard<std::mutex> lock(overhang_types_mutex);
+                    for (auto &kv : local_types)
+                        overhang_types.emplace(kv.first, kv.second);
+                }
+            });
+        layers_with_overhangs    = atomic_layers_with_overhangs.load();
+        layers_with_enforcers    = atomic_layers_with_enforcers.load();
+        has_cantilever           = atomic_has_cantilever.load();
+        has_sharp_tails          = atomic_has_sharp_tails.load();
+        m_highest_overhang_layer = atomic_highest_overhang_layer.load();
+    } else {
+        for (int layer_nr = 0; layer_nr < m_object->layer_count(); layer_nr++) {
+            if (m_object->print()->canceled())
+                break;
+            auto [has_overhangs, has_enforcers, layer_cantilever] = process_overhang_layer(layer_nr, nullptr, nullptr);
+            if (has_overhangs) {
+                layers_with_overhangs++;
+                m_highest_overhang_layer = std::max(m_highest_overhang_layer, size_t(layer_nr));
+            }
+            if (has_enforcers)
+                layers_with_enforcers++;
+            if (layer_cantilever)
+                has_cantilever = true;
+        }
     }
+    // FORK(tree-support-fast-draw) END
 
     BOOST_LOG_TRIVIAL(info) << "Tree support overhang detection done. " << layers_with_overhangs << " layers with overhangs. nEnforced=" << layers_with_enforcers;
 

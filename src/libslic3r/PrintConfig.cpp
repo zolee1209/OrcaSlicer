@@ -7819,6 +7819,21 @@ void PrintConfigDef::init_fff_params()
     def->tooltip = L("Distance from tree branch to the outermost brim line.");
     def->set_default_value(new ConfigOptionFloat(3));
 
+    // FORK(tree-support-fast-draw): experimental, finer-grained parallelization of organic tree
+    // support branch drawing and overhang detection. Intended to speed up slicing of large models
+    // with heavy tree support without changing the resulting support geometry/g-code; off by
+    // default so the stock code path is used unless explicitly requested (CLI, project file, or
+    // GUI with Mode: Develop).
+    def = this->add("tree_support_fast_mode", coBool);
+    def->label = L("Fast tree support (experimental)");
+    def->category = L("Support");
+    def->tooltip = L("Use a more finely parallelized algorithm to draw organic tree support branches "
+                      "and to detect overhangs, which can noticeably speed up slicing of large models "
+                      "with heavy tree support. The resulting support should be identical to the "
+                      "standard algorithm; this is an experimental option for performance testing.");
+    def->mode = comDevelop;
+    def->set_default_value(new ConfigOptionBool(false));
+
     def = this->add("tree_support_tip_diameter", coFloat);
     def->label = L("Tip Diameter");
     def->category = L("Support");

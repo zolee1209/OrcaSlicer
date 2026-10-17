@@ -1362,6 +1362,8 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionInt,                tree_support_wall_count))
     ((ConfigOptionBool,               tree_support_auto_brim))
     ((ConfigOptionFloat,              tree_support_brim_width))
+    // FORK(tree-support-fast-draw): experimental branch-level parallel tree support generation.
+    ((ConfigOptionBool,               tree_support_fast_mode))
     ((ConfigOptionBool,               detect_narrow_internal_solid_infill))
     // ((ConfigOptionBool,               adaptive_layer_height))
     ((ConfigOptionFloat,              support_bottom_interface_spacing))

@@ -260,6 +260,48 @@ features:
       (convert, Viewer::load, bbox, statisztika, gcode_window) és az első render. G-code kimenet nem változik.
       Háttér: fork/perf/2026-10-16-gcode-phase-profile.md.
 
+  - id: tree-support-fast-draw
+    name: "tree_support_fast_mode kapcsoló: finomabb szemcséjű párhuzamosítás a tree support ág-rajzolásban és az overhang-detektálásban"
+    status: fork-only
+    cli: ["--tree-support-fast-mode (generikus read_cli override, bool flag, nincs külön CLI-kód; '='-jellel is: --tree-support-fast-mode=0)"]
+    config: [tree_support_fast_mode (PrintObjectConfig, GUI: Support oldal, Mode: Develop)]
+    hooks: [src/libslic3r/PrintConfig.hpp, src/libslic3r/PrintConfig.cpp, src/libslic3r/PrintObject.cpp, src/libslic3r/Support/TreeSupport.cpp, src/libslic3r/Support/TreeSupport3D.cpp, src/slic3r/GUI/Tab.cpp]
+    commits: []
+    test: null
+    notes: >
+      Alap (kapcsoló ki, alapértelmezett): a kód szó szerint a mai útvonalon fut, nulla kockázat.
+      Mérés 2026-10-17 (referencia: Battle_Damaged_Helmet.stl, RatRig V-Core 4 IDEX 0.4, tree(auto) organic
+      support, crosshatch 15%, 1521 réteg, 40 mag): a teljes szeletelés ~270 s, ebből a tree support ~208 s
+      (77%), az infill csak ~5,6 s (2%). A szeletelést fázisonként pidstat-tal mértük (perf nem elérhető
+      sudo nélkül, perf_event_paranoid=4).
+      1) organic_draw_branches (TreeSupport3D.cpp): a drága rész (extrude_branch + slice_mesh + ütközés/ágy/
+      öv-vágás + bottom contacts + recover_pending_branch_roofs + záró üres-szeletek levágása) kiemelve egy
+      új draw_branch_slices() függvénybe; a soros (kikapcsolt) és a gyors (fánkénti helyett ágankénti flat
+      tbb::parallel_for) út ugyanazt a függvényt hívja, csak eltérő feladat-granularitással, így a két út
+      logikailag azonos. A fánkénti tree.slices összefésülés (sorrendfüggetlen Clipper-unió) olcsó, ezért
+      fánként maradt, csak a drága rész lett szétosztva az összes ág között (eddig egy-két óriásfa a sor
+      végén egyedül, 1 magon futott ~80+19 s-ig).
+      2) TreeSupport::detect_overhangs (TreeSupport.cpp): csak a két, cross-layer/cross-cluster függőség
+      nélküli al-ciklus lett párhuzamosítva (kis overhang eltávolítás clusterenként; záró rétegenkénti
+      loverhangs/cantilever/enforcer összegzés szálankénti helyi gyűjtéssel + egyszeri összefésüléssel a
+      megosztott overhang_types map-be és számlálókba). A sharp-tail felhalmozó ciklus (réteg L+1 olvassa L
+      véglegesített eredményét) és a cluster-építő ciklus (soros beszúrás egy közös listába) valódi
+      lánc-függőségűek, ÉRINTETLENEK maradtak.
+      Nyitott pont, további ellenőrzésre (nem ehhez a funkcióhoz, hanem a most érintetlenül hagyott részekhez):
+      create_layer_pathing / merge_influence_areas (PrintObject.cpp-ből hívott TreeSupport3D.cpp réteg-
+      propagáció, ~89 s, rétegenként soros, a merge nem asszociatív) — hasonlóan a sharp-tail lánchoz és a
+      cluster-építéshez, csak korlátozottan (a kódkomment szerint is legfeljebb ~2x) párhuzamosítható anélkül,
+      hogy a sorrendfüggő eredmény megváltozna; külön vizsgálat kell, mielőtt hozzányúlunk.
+      Ellenőrzés: build (ninja -f build-Release.ninja orca-slicer), majd a referenciaparanccsal flag ki/be
+      futtatás, plate_1.gcode összehasonlítás (azonos bemenet, Clipper egész-koordinátás determinizmus miatt
+      bitazonos kimenetet várunk).
+      Mérés eredménye (ugyanaz a referencia, flag be, 1 futás): tree support összesen 165,4 s (207,3 s helyett,
+      kb. -20%), ebből az overhang-detektálás szerializált farka ~4,6 s (7,5 s helyett). Teljes szeletelés
+      ~228,6 s (271,1 s helyett, kb. -16%). plate_1.gcode a flag ki/be között csak a config-dump lábléc
+      "tree_support_fast_mode" sorában és a már korábban is meglévő, a --parallel g-code exportból eredő
+      ;_SUPP_INTERFACE_FAN_END/START jelölő-pozíció zajban (két flag=ki futás között is jelentkezik, tehát
+      nem ettől a funkciótól ered) tér el; a tényleges geometria azonos.
+
   - id: fix-mmu-unpainted
     name: ModelVolume::get_extruders – festetlen térfogatnál kimarad a TriangleSelector építés
     status: fork-only
