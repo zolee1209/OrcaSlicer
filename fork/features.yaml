@@ -301,6 +301,15 @@ features:
       "tree_support_fast_mode" sorában és a már korábban is meglévő, a --parallel g-code exportból eredő
       ;_SUPP_INTERFACE_FAN_END/START jelölő-pozíció zajban (két flag=ki futás között is jelentkezik, tehát
       nem ettől a funkciótól ered) tér el; a tényleges geometria azonos.
+      2026-10-17 kiegészítő vizsgálat (nem commitolva, elvetve): a TreeModelVolumes::RadiusLayerPolygonCache
+      minden olvasása (getArea/get_lower_bound_area/getMaxCalculatedLayer) kizárólagos std::mutex-et vesz,
+      még cache-találatnál is; gyanú volt, hogy ez korlátozza a create_layer_pathing rétegen belüli
+      parallel_for-ját. std::mutex → std::shared_mutex csere (olvasóknak shared_lock, íróknak unique_lock)
+      kipróbálva: a geometria változatlan maradt (plate_1.gcode ugyanaz a zaj), de a falidőn (sem stock, sem
+      fast_mode mellett) nem mért javulást — a create_layer_pathing alacsony (~5,5 mag) kihasználtsága
+      valószínűleg nem lock-kontencióból, hanem rétegenkénti alacsony elemszámból ered. gdb/strace alapú
+      szálmintavétel nem elérhető ezen a gépen (ptrace_scope korlátozás, ugyanaz mint a perf-nél), ezért a
+      pontos ok nem igazolható tovább; a changeset nincs a repóban (visszavonva bizonyított haszon nélkül).
 
   - id: fix-mmu-unpainted
     name: ModelVolume::get_extruders – festetlen térfogatnál kimarad a TriangleSelector építés
