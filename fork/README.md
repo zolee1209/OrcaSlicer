@@ -49,6 +49,16 @@ python3 fork/tools/gprof-report.py build/src/Release/orca-slicer build/bench/pro
 - Profilozáshoz nem strippelt bináris kell (sima `ninja -f build-Release.ninja orca-slicer`; a `build_linux.sh -x` strippel).
 - Zaj ezen a gépen ~±4%: döntéshez `--runs 3`.
 
+## PGO-s fő bináris
+
+```bash
+fork/tools/pgo-train.sh -j 20                                          # instrumentált build + profilgyűjtés (~30 perc)
+bash build_linux.sh -x -s -j 20 -P build-pgo-data/merged.profdata     # fő build/ PGO-val (~8–10 perc)
+```
+
+- A profilt havi szinkron vagy nagyobb kódváltozás után újra kell gyűjteni (a régi nem hibás, csak egyre kevesebbet ér).
+- `-P` nélkül a `build_linux.sh -x -s` újra profil nélkül fordít (a flagek változása miatt teljes újrafordítás).
+
 ## Konvenciók
 
 - Kódcímke upstream fájlban: `// FORK(<id>): ...` vagy `// FORK(<id>) BEGIN` … `// FORK(<id>) END`

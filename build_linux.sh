@@ -30,6 +30,7 @@ function usage() {
     echo "   -l: use Clang instead of GCC (default: GCC)"
     echo "   -L: use ld.lld as linker (if available)"
     echo "   -x: native CPU optimized build (Xeon 6148 / skylake-avx512, GCC 14, LTO, strip)"
+    echo "   -P file: profile-guided optimization: compile OrcaSlicer with -fprofile-use=file (requires -x with Clang; profile: fork/tools/pgo-train.sh)" # FORK(build-pgo)
     echo "For a first use, you want to './${SCRIPT_NAME} -u'"
     echo "   and then './${SCRIPT_NAME} -dsi'"
     echo "For a GitHub Actions-like Linux build locally, use './${SCRIPT_NAME} -g -istrlL'"
@@ -44,7 +45,7 @@ unset name
 BUILD_DIR=build
 BUILD_CONFIG=Release
 FORWARDED_ARGS=()
-while getopts ":1j:J:bcCdDeFghiprstulLx" opt ; do
+while getopts ":1j:J:bcCdDeFghiprstulLxP:" opt ; do # FORK(build-pgo): P:
   case ${opt} in
     1 )
         export CMAKE_BUILD_PARALLEL_LEVEL=1
@@ -128,6 +129,12 @@ while getopts ":1j:J:bcCdDeFghiprstulLx" opt ; do
     x )
         NATIVE_OPTIMIZED="1"
         ;;
+    # FORK(build-pgo) BEGIN
+    P )
+        PGO_PROFDATA=$(realpath "$OPTARG")
+        FORWARDED_ARGS+=("-P" "$PGO_PROFDATA")
+        ;;
+    # FORK(build-pgo) END
     * )
 	echo "Unknown argument '${opt}', aborting."
 	exit 1
@@ -517,6 +524,8 @@ fi
 #     - LLD linker (required for Clang ThinLTO)
 #     - strip --strip-all on the final binary
 # ---------------------------------------------------------------------------
+# FORK(build-pgo)
+if [[ -n "${PGO_PROFDATA}" && -z "${NATIVE_OPTIMIZED}" ]] ; then echo "Error: -P (PGO) requires -x." ; exit 1 ; fi
 NATIVE_OPT_CFLAGS=()
 NATIVE_OPT_LDFLAGS=()
 NATIVE_OPT_STRIP="0"
@@ -618,14 +627,48 @@ if [[ -n "${NATIVE_OPTIMIZED}" ]] ; then
         echo ">>> Allocator  : glibc default (libjemalloc.so.2 not found, install libjemalloc2 to enable)"
     fi
 
+    # FORK(build-pgo) BEGIN: ThinLTO runs its backend on every core at link time, which with -j N should
+    # follow N too (memory: ~1 GB per backend job on this code base).
+    LTO_LINK_JOBS=""
+    if [[ -n "${LTO_FLAGS}" && -n "${CMAKE_BUILD_PARALLEL_LEVEL}" ]] ; then
+        if [[ "${LINKER_FLAG}" == "-fuse-ld=gold" ]] ; then
+            LTO_LINK_JOBS="-Wl,-plugin-opt,jobs=${CMAKE_BUILD_PARALLEL_LEVEL}"
+        else
+            LTO_LINK_JOBS="-Wl,--thinlto-jobs=${CMAKE_BUILD_PARALLEL_LEVEL}"
+        fi
+        echo ">>> ThinLTO link jobs: ${CMAKE_BUILD_PARALLEL_LEVEL}"
+    fi
+    NATIVE_C_FLAGS_RELEASE="-O3 ${ARCH_FLAGS} ${LTO_FLAGS} ${EXTRA_FLAGS} -DNDEBUG"
+    # FORK(build-pgo) END
+
     NATIVE_OPT_CFLAGS=(
         "-DCMAKE_LINKER=${GOLD_BIN}"
-        "-DCMAKE_C_FLAGS_RELEASE=-O3 ${ARCH_FLAGS} ${LTO_FLAGS} ${EXTRA_FLAGS} -DNDEBUG"
-        "-DCMAKE_CXX_FLAGS_RELEASE=-O3 ${ARCH_FLAGS} ${LTO_FLAGS} ${EXTRA_FLAGS} -DNDEBUG"
-        "-DCMAKE_EXE_LINKER_FLAGS_RELEASE=${LTO_FLAGS} ${STATIC_RUNTIME_LDFLAGS} ${LINKER_FLAG} ${JEMALLOC_LDFLAGS}"
-        "-DCMAKE_SHARED_LINKER_FLAGS_RELEASE=${LTO_FLAGS} ${LINKER_FLAG}"
-        "-DCMAKE_MODULE_LINKER_FLAGS_RELEASE=${LTO_FLAGS} ${LINKER_FLAG}"
+        "-DCMAKE_C_FLAGS_RELEASE=${NATIVE_C_FLAGS_RELEASE}"
+        "-DCMAKE_CXX_FLAGS_RELEASE=${NATIVE_C_FLAGS_RELEASE}"
+        "-DCMAKE_EXE_LINKER_FLAGS_RELEASE=${LTO_FLAGS} ${STATIC_RUNTIME_LDFLAGS} ${LINKER_FLAG} ${JEMALLOC_LDFLAGS} ${LTO_LINK_JOBS}"
+        "-DCMAKE_SHARED_LINKER_FLAGS_RELEASE=${LTO_FLAGS} ${LINKER_FLAG} ${LTO_LINK_JOBS}"
+        "-DCMAKE_MODULE_LINKER_FLAGS_RELEASE=${LTO_FLAGS} ${LINKER_FLAG} ${LTO_LINK_JOBS}"
     )
+
+    # FORK(build-pgo) BEGIN: the profile applies to OrcaSlicer's own code only, not to the deps build.
+    ORCA_PGO_CFLAGS=()
+    if [[ -n "${PGO_PROFDATA}" ]] ; then
+        if [[ -z "${USE_CLANG_NATIVE}" ]] ; then
+            echo "Error: -P (PGO) needs the Clang toolchain selected by -x."
+            exit 1
+        fi
+        if [[ ! -f "${PGO_PROFDATA}" ]] ; then
+            echo "Error: PGO profile not found: ${PGO_PROFDATA}"
+            exit 1
+        fi
+        PGO_FLAGS="-fprofile-use=${PGO_PROFDATA} -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date -Wno-backend-plugin"
+        ORCA_PGO_CFLAGS=(
+            "-DCMAKE_C_FLAGS_RELEASE=${NATIVE_C_FLAGS_RELEASE} ${PGO_FLAGS}"
+            "-DCMAKE_CXX_FLAGS_RELEASE=${NATIVE_C_FLAGS_RELEASE} ${PGO_FLAGS}"
+        )
+        echo ">>> PGO       : ${PGO_PROFDATA}"
+    fi
+    # FORK(build-pgo) END
 
     # Strip the binary after linking
     NATIVE_OPT_STRIP="1"
@@ -739,7 +782,8 @@ if [[ -n "${BUILD_ORCA}" ]] || [[ -n "${BUILD_TESTS}" ]] ; then
         BUILD_ARGS+=(-DORCA_UPDATER_SIG_KEY="${ORCA_UPDATER_SIG_KEY}")
     fi
 
-    print_and_run cmake -S . -B $BUILD_DIR "${CMAKE_C_CXX_COMPILER_CLANG[@]}" "${CMAKE_LLD_LINKER_ARGS[@]}" "${CMAKE_CCACHE_ARGS[@]}" "${NATIVE_OPT_CFLAGS[@]}" -G "Ninja Multi-Config" \
+    # FORK(build-pgo): ORCA_PGO_CFLAGS after NATIVE_OPT_CFLAGS, so that its C/CXX flags take precedence.
+    print_and_run cmake -S . -B $BUILD_DIR "${CMAKE_C_CXX_COMPILER_CLANG[@]}" "${CMAKE_LLD_LINKER_ARGS[@]}" "${CMAKE_CCACHE_ARGS[@]}" "${NATIVE_OPT_CFLAGS[@]}" "${ORCA_PGO_CFLAGS[@]}" -G "Ninja Multi-Config" \
 -DSLIC3R_PCH=${SLIC3R_PRECOMPILED_HEADERS} \
 -DORCA_TOOLS=ON \
 "${COLORED_OUTPUT}" \

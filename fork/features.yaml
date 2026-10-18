@@ -401,6 +401,28 @@ features:
     test: null
     notes: Leírás a BUILD_OPTIMIZED.md és a BUILD_PERFORMANCE_UBUNTU26.md fájlban.
 
+  - id: build-pgo
+    name: Profile-guided optimization a fő buildhez (fork/tools/pgo-train.sh + build_linux.sh -P), ThinLTO link-szálak a -j-hez kötve
+    status: fork-only
+    owned_files: [fork/tools/pgo-train.sh, fork/bench/process/nosupport.json]
+    hooks: [build_linux.sh]
+    cli: ["build_linux.sh -P <profdata> (csak -x mellett, Clang)"]
+    commits: []
+    test: null
+    notes: >
+      Menet: `fork/tools/pgo-train.sh -j 20` (instrumentált build a build-pgo-gen/-be a fő build CMakeCache flagjeivel +
+      -fprofile-generate, lld-vel linkelve; profilgyűjtés: helmet + Benchy x20 tree supporttal + Benchy x20 support nélkül,
+      egyszálúan, külön CPU-ra kötve, párhuzamosan; merge → build-pgo-data/merged.profdata), majd
+      `bash build_linux.sh -x -s -j 20 -P build-pgo-data/merged.profdata`. A -P csak az OrcaSlicer saját kódját fordítja
+      profillal (a deps-et nem). A -j N mostantól a ThinLTO link-backend szálait is N-re korlátozza (gold: -plugin-opt,jobs=N;
+      lld: --thinlto-jobs=N), a memória miatt. Buktatók: a gold nem linkeli az instrumentált ThinLTO-t a nem instrumentált
+      statikus deps-szel ("discarded section", pl. libdraco.a) → az instrumentált build lld-vel; több szálon az instrumentált
+      bináris 20–60× lassú (közös számlálók, cache-line kontenció; Benchy 1 CPU: 18 CPU-s, 10 CPU: 329 CPU-s) → egyszálú
+      profilgyűjtés. Mérés 2026-10-17 (helmet, 3-3 futás, medián): kapcsolók nélkül 231,3 → 216,4 s (−6,4%), az összes
+      optimalizációval 107,7 → 102,2 s (−5,1%); a geometria bitazonos. A profil a forrás változásával fokozatosan elavul
+      (figyelmeztetés kikapcsolva): havi szinkron / nagyobb változás után újra kell gyűjteni. Idő -j 20-szal: instrumentált
+      build ~10 perc, profilgyűjtés ~20 perc, PGO-build ~8 perc; csúcsmemória ~28 GB.
+
   - id: build-jemalloc
     name: jemalloc allokátor linkelése (-l:libjemalloc.so.2), ha elérhető
     status: fork-only
