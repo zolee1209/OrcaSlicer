@@ -250,7 +250,7 @@ features:
     status: fork-only
     owned_files: [src/libslic3r/Support/TreeSupport3DPerf.hpp]
     hooks: [src/libslic3r/Support/TreeSupport3D.cpp]
-    commits: []
+    commits: [4f141622b9]
     test: null
     notes: >
       2026-10-18, mérés: helmet referencia (fork/tools/bench.py), a G-code geometriája bitazonos. 1) merge_influence_areas_two_elements:
@@ -269,7 +269,7 @@ features:
     status: fork-only
     owned_files: [src/libslic3r/ForkRingIndex.hpp]
     hooks: [src/libslic3r/ConnectedBodies.hpp, src/libslic3r/ConnectedBodies.cpp, src/libslic3r/GCode/GCodeProcessor.cpp]
-    commits: []
+    commits: [201d09d83e]
     test: null
     notes: >
       2026-10-18, mérés: helmet referencia, G-code és a tömeg-eredmények (object/body/support masses ujjlenyomata) bitazonosak.
@@ -284,7 +284,7 @@ features:
     status: fork-only
     owned_files: [src/libslic3r/ForkPerfTimer.hpp]
     hooks: [src/libslic3r/GCode.cpp, src/libslic3r/GCode/GCodeProcessor.cpp, src/slic3r/GUI/BackgroundSlicingProcess.cpp, src/slic3r/GUI/Plater.cpp, src/slic3r/GUI/GUI_Preview.cpp, src/slic3r/GUI/GCodeViewer.cpp, src/libslic3r/Support/TreeSupport3D.cpp]
-    commits: [9356fc9956]
+    commits: [9356fc9956, d34af0dc22]
     test: null
     notes: >
       Diagnosztika: "[fork-perf] <lépés>: <ms> ms" sorok info szinten (CLI --debug 4, GUI log_severity_level=info);
@@ -302,7 +302,7 @@ features:
     cli: []
     config: []
     hooks: [src/libslic3r/PrintConfig.cpp, src/libslic3r/Support/TreeSupport.cpp, src/libslic3r/Support/TreeSupport3D.cpp]
-    commits: [4d8a27b532]
+    commits: [4d8a27b532, 569c0eb0c3]
     test: null
     notes: >
       2026-10-18: FIXEN BEKAPCSOLVA, a tree_support_fast_mode kapcsoló (config, CLI, GUI) megszűnt; a régi soros utak
@@ -407,7 +407,7 @@ features:
     owned_files: [fork/tools/pgo-train.sh, fork/bench/process/nosupport.json]
     hooks: [build_linux.sh]
     cli: ["build_linux.sh -P <profdata> (csak -x mellett, Clang)"]
-    commits: []
+    commits: [16f3763872]
     test: null
     notes: >
       Menet: `fork/tools/pgo-train.sh -j 20` (instrumentált build a build-pgo-gen/-be a fő build CMakeCache flagjeivel +
@@ -422,6 +422,10 @@ features:
       optimalizációval 107,7 → 102,2 s (−5,1%); a geometria bitazonos. A profil a forrás változásával fokozatosan elavul
       (figyelmeztetés kikapcsolva): havi szinkron / nagyobb változás után újra kell gyűjteni. Idő -j 20-szal: instrumentált
       build ~10 perc, profilgyűjtés ~20 perc, PGO-build ~8 perc; csúcsmemória ~28 GB.
+      2026-10-18 végső mérés (fő bináris: build_linux.sh -x -s -j 20 -P, a végleges forrással gyűjtött profillal; helmet,
+      fork/tools/bench.py, 3-3 futás, medián): 100,8 s (±0,7); ugyanez PGO nélkül 109,5 s (−7,9% a PGO-tól); a 2026-10-17-i
+      kiinduló állapot (fast mode, a mostani optimalizációk nélkül) 231,3 s → összesen −56,4%. A geometria mindenhol bitazonos
+      (digest 11771a97cd6ffc23). pgo-train.sh -j 20: 28 perc, csúcs 22 GB; PGO-s fő build: 9,5 perc, csúcs 23 GB.
 
   - id: build-jemalloc
     name: jemalloc allokátor linkelése (-l:libjemalloc.so.2), ha elérhető
@@ -480,7 +484,7 @@ features:
     status: fork-only
     owned_files: [fork, .github/instructions/orca-fork.instructions.md, .github/skills/orca-fork]
     hooks: [.gitignore]
-    commits: [477f05313c, 5fa2ffd30a]
+    commits: [477f05313c, 5fa2ffd30a, c8f90ef98e]
     test: null
     notes: >
       2026-10-18: teljesítménymérő eszközök. fork/tools/bench.py (run/compare/list: rögzített process-profil
