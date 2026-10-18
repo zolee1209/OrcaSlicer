@@ -2907,6 +2907,7 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
         m_processor.result().filament_printable_reuslt = FilamentPrintableResult(conflict_filament, bed_type_to_gcode_string(m_config.curr_bed_type));
     }
     // check gcode is valid in machine printabele area and multi_extruder printabele area
+    const ForkPerfClock::time_point perf_check = ForkPerfClock::now(); // FORK(perf-phase-timers)
     int extruder_size = m_print->config().nozzle_diameter.values.size();
     std::vector<Polygons> extruder_unprintable_polys   = m_print->get_extruder_unprintable_polygons();
     Pointfs               plate_printable_area         = m_print->config().printable_area.values;
@@ -2914,6 +2915,7 @@ void GCode::do_export(Print* print, const char* path, GCodeProcessorResult* resu
     m_processor.check_multi_extruder_gcode_valid(extruder_size, plate_printable_area, m_print->config().printable_height.value, wrapping_exclude_area_points,
                                                  extruder_unprintable_polys, m_print->get_extruder_printable_height(),  m_print->get_filament_maps(),
                                                  m_print->get_physical_unprintable_filaments(m_print->get_slice_used_filaments(false)));
+    fork_perf_log("export: check_multi_extruder_gcode_valid", fork_perf_ms_since(perf_check)); // FORK(perf-phase-timers)
 
     // Hand the per-filament nozzle grouping to the processor BEFORE finalize, so the
     // pre-heat injector's second pass can resolve filament->nozzle->extruder (get_nozzle_from_id /

@@ -38,6 +38,7 @@
 #include "I18N.hpp"
 #include "libslic3r/libslic3r.h"
 #include "libslic3r/Utils.hpp"
+#include "libslic3r/ForkPerfTimer.hpp" // FORK(perf-phase-timers)
 
 #include <algorithm>
 #include <Eigen/Geometry>
@@ -4057,7 +4058,10 @@ void organic_draw_branches(
 
     throw_on_cancel();
 
+    ForkPerfClock::time_point perf_t = ForkPerfClock::now(); // FORK(perf-phase-timers)
     organic_smooth_branches_avoid_collisions(print_object, volumes, config, move_bounds, elements_with_link_down, linear_data_layers, throw_on_cancel);
+    fork_perf_log("tree support: smooth branches", fork_perf_ms_since(perf_t)); // FORK(perf-phase-timers)
+    perf_t = ForkPerfClock::now(); // FORK(perf-phase-timers)
 
     // Reduce memory footprint. After this point only finalize_interface_and_support_areas() will use volumes and from that only collisions with zero radius will be used.
     volumes.clear_all_but_object_collision();
@@ -4172,6 +4176,8 @@ void organic_draw_branches(
     const SlicingParameters &slicing_params = print_object.slicing_parameters();
     MeshSlicingParams mesh_slicing_params;
     mesh_slicing_params.mode = MeshSlicingParams::SlicingMode::Positive;
+    fork_perf_log("tree support: collect trees", fork_perf_ms_since(perf_t)); // FORK(perf-phase-timers)
+    perf_t = ForkPerfClock::now(); // FORK(perf-phase-timers)
 // FORK(tree-support-fast-draw) BEGIN
     if (print_object.config().tree_support_fast_mode.value) {
     {
@@ -4329,6 +4335,8 @@ void organic_draw_branches(
         }, tbb::simple_partitioner());
     }
     // FORK(tree-support-fast-draw) END
+    fork_perf_log("tree support: draw branches", fork_perf_ms_since(perf_t)); // FORK(perf-phase-timers)
+    perf_t = ForkPerfClock::now(); // FORK(perf-phase-timers)
 
     tbb::parallel_for(tbb::blocked_range<size_t>(0, trees.size(), 1),
         [&trees, &throw_on_cancel](const tbb::blocked_range<size_t> &range) {
@@ -4348,6 +4356,8 @@ void organic_draw_branches(
             throw_on_cancel();
         }
     }, tbb::simple_partitioner());
+    fork_perf_log("tree support: per-tree union", fork_perf_ms_since(perf_t)); // FORK(perf-phase-timers)
+    perf_t = ForkPerfClock::now(); // FORK(perf-phase-timers)
 
     size_t num_layers = 0;
     for (Tree &tree : trees)
@@ -4380,6 +4390,8 @@ void organic_draw_branches(
             }
         }
 
+    fork_perf_log("tree support: merge trees per layer", fork_perf_ms_since(perf_t)); // FORK(perf-phase-timers)
+    perf_t = ForkPerfClock::now(); // FORK(perf-phase-timers)
     tbb::parallel_for(tbb::blocked_range<size_t>(0, std::min(move_bounds.size(), slices.size()), 1),
         [&print_object, &config, &slices, &bottom_contacts, &top_contacts, &intermediate_layers, &layer_storage, &throw_on_cancel](const tbb::blocked_range<size_t> &range) {
         for (size_t layer_idx = range.begin(); layer_idx < range.end(); ++layer_idx) {
@@ -4422,6 +4434,7 @@ void organic_draw_branches(
             throw_on_cancel();
         }
     }, tbb::simple_partitioner());
+    fork_perf_log("tree support: per-layer union", fork_perf_ms_since(perf_t)); // FORK(perf-phase-timers)
 }
 
 } // namespace TreeSupport3D
