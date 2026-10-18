@@ -264,6 +264,21 @@ features:
       Nyitott (külön feladat): clip_clipper_polygons_with_subject_bbox – 8 M hívás 13,8 milliárd csúcsot olvas, ebből 0,4%
       marad; poligononkénti szakasz-bbox index kellene a TreeModelVolumes cache-ben (invazív), becslés ~3–4 s.
 
+  - id: perf-gcode-processor
+    name: Kimenet-azonos gyorsítások a G-code utófeldolgozásban (mass locator pont-poligon index, bbox-only nyomtatási terület ellenőrzés)
+    status: fork-only
+    owned_files: [src/libslic3r/ForkRingIndex.hpp]
+    hooks: [src/libslic3r/ConnectedBodies.hpp, src/libslic3r/ConnectedBodies.cpp, src/libslic3r/GCode/GCodeProcessor.cpp]
+    commits: []
+    test: null
+    notes: >
+      2026-10-18, mérés: helmet referencia, G-code és a tömeg-eredmények (object/body/support masses ujjlenyomata) bitazonosak.
+      1) IslandLocator (a GCodeProcessor mass locatora, upstream #16291): minden extrudáló G1-nél ExPolygon::contains() a sűrű
+      (resolution 0.001) szigeteken; helyette y-vödrös élindex (RingPointInPolygonIndex), ugyanazzal a Clipper1 PointInPolygon
+      logikával, csak a pont vödrének élein (a többi él nem járul hozzá) → a soros GCodeProcessor szakasz 33,3 → 24,7 s.
+      Lustán épül, nem szálbiztos (a mass locator sorosan hívja). 2) check_multi_extruder_gcode_valid: az összes extrudálási pont
+      (29 M) map-be gyűjtése helyett csak bbox + max Z (csak ezeket olvassa a függvény), 3,7 → 0,4 s.
+
   - id: perf-phase-timers
     name: Fázis-időmérők a G-code exporthoz és a GUI előnézet-betöltéshez ([fork-perf] info log)
     status: fork-only

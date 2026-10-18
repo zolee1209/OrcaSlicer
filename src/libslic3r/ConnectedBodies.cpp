@@ -105,9 +105,25 @@ IslandLocator::IslandLocator(const ExPolygons &islands, coord_t margin) : m_isla
                 m_alone[order[a]] = m_alone[order[b]] = false;
 }
 
+// FORK(perf-gcode-processor) BEGIN
+bool IslandLocator::island_contains(size_t island, const Point &point) const
+{
+    const ExPolygon &expoly = (*m_islands)[island];
+    // Short outlines are scanned faster than indexed.
+    if (expoly.contour.points.size() < 64)
+        return expoly.contains(point);
+    if (m_contains_index.empty())
+        m_contains_index.resize(m_islands->size());
+    ExPolygonContainsIndex &index = m_contains_index[island];
+    if (!index.built())
+        index.build(expoly);
+    return index.contains(point);
+}
+// FORK(perf-gcode-processor) END
+
 bool IslandLocator::holds(size_t island, const Point &point, bool strict) const
 {
-    return m_boxes[island].contains(point) && ((m_alone[island] && !strict) || (*m_islands)[island].contains(point));
+    return m_boxes[island].contains(point) && ((m_alone[island] && !strict) || island_contains(island, point)); // FORK(perf-gcode-processor)
 }
 
 std::pair<int, double> IslandLocator::find(const Point &point, bool strict) const
@@ -116,7 +132,7 @@ std::pair<int, double> IslandLocator::find(const Point &point, bool strict) cons
     double distance = std::numeric_limits<double>::max();
     for (size_t i = 0; i < m_boxes.size(); ++i)
         if (m_boxes[i].contains(point)) {
-            if ((m_alone[i] && !strict) || (*m_islands)[i].contains(point))
+            if ((m_alone[i] && !strict) || island_contains(i, point)) // FORK(perf-gcode-processor)
                 return { int(i), 0. };
             if (const double d = ((*m_islands)[i].point_projection(point) - point).cast<double>().squaredNorm(); d < distance) {
                 distance = d;

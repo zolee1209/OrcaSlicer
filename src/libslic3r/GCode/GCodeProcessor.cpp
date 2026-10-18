@@ -2889,34 +2889,44 @@ bool GCodeProcessor::check_multi_extruder_gcode_valid(const int                 
         return Vec3d(build.x() + m_x_offset, build.y() + m_y_offset, build.z());
     };
 
+    // FORK(perf-gcode-processor) BEGIN: only the box and the top of the extrusions are checked below, so gather just
+    // those instead of every extrusion point (tens of millions on large prints), looking the map up only when the
+    // object or extruder changes. The box of the points equals the box of the polygon made of them.
     struct GCodePosInfo
     {
-        Points pos;
-        Points pos_custom;
-        float  max_print_z;
-        float  max_print_z_custom;
+        BoundingBox bbox;
+        float       max_print_z;
+        float       max_print_z_custom;
     };
     std::map<int, std::map<int, GCodePosInfo>> gcode_path_pos; // object_id, filament_id, pos
-    for (const GCodeProcessorResult::MoveVertex &move : m_result.moves) {
-        // sometimes, the start line extrude was outside the edge of plate a little, this is allowed, so do not include into the gcode_path_pos
-        if (move.type == EMoveType::Extrude /* && move.extrusion_role != ExtrusionRole::erFlush || move.type == EMoveType::Travel*/) {
+    {
+        int           last_object   = std::numeric_limits<int>::min();
+        int           last_extruder = -1;
+        GCodePosInfo *info          = nullptr;
+        for (const GCodeProcessorResult::MoveVertex &move : m_result.moves) {
+            // sometimes, the start line extrude was outside the edge of plate a little, this is allowed, so do not include into the gcode_path_pos
+            if (move.type != EMoveType::Extrude)
+                continue;
             const Vec3d cp = compare_pos(move);
             // For belt printers we read Z from the inverse-transformed position
             // (post-origin-snap, pre-machine-frame).  Otherwise keep the
             // original print_z source (the slicer's layer-Z comment) so
             // non-belt behaviour is bit-for-bit unchanged.
             const float z_for_height = machine_frame_active ? float(cp.z()) : move.print_z;
-            if (move.extrusion_role == ExtrusionRole::erCustom) {
-                gcode_path_pos[move.object_label_id][int(move.extruder_id)].pos_custom.emplace_back(to_2d(cp));
-                gcode_path_pos[move.object_label_id][int(move.extruder_id)].max_print_z_custom =
-                    std::max(gcode_path_pos[move.object_label_id][int(move.extruder_id)].max_print_z_custom, z_for_height);
-            } else {
-                gcode_path_pos[move.object_label_id][int(move.extruder_id)].pos.emplace_back(to_2d(cp));
-                gcode_path_pos[move.object_label_id][int(move.extruder_id)].max_print_z = std::max(gcode_path_pos[move.object_label_id][int(move.extruder_id)].max_print_z,
-                                                                                                   z_for_height);
+            if (info == nullptr || move.object_label_id != last_object || int(move.extruder_id) != last_extruder) {
+                last_object   = move.object_label_id;
+                last_extruder = int(move.extruder_id);
+                info          = &gcode_path_pos[last_object][last_extruder];
+            }
+            if (move.extrusion_role == ExtrusionRole::erCustom)
+                info->max_print_z_custom = std::max(info->max_print_z_custom, z_for_height);
+            else {
+                info->bbox.merge(to_2d(cp));
+                info->max_print_z = std::max(info->max_print_z, z_for_height);
             }
         }
     }
+    // FORK(perf-gcode-processor) END
 
     bool valid = true;
     Point plate_offset = Point(scale_(m_x_offset), scale_(m_y_offset));
@@ -2933,11 +2943,8 @@ bool GCodeProcessor::check_multi_extruder_gcode_valid(const int                 
         const std::map<int, GCodePosInfo> &path_pos        = obj_iter->second;
         for (auto iter = path_pos.begin(); iter != path_pos.end(); ++iter) {
             int extruder_id = filament_map[iter->first] - 1;
-            Points iter_points;//temp points
-            iter_points.insert(iter_points.end(), iter->second.pos.begin(), iter->second.pos.end());// put object/wipetower extrude position in
-            Polygon     path_poly(iter_points);
-            if (path_poly.empty()) continue;
-            BoundingBox bbox = path_poly.bounding_box();
+            const BoundingBox &bbox = iter->second.bbox; // FORK(perf-gcode-processor)
+            if (!bbox.defined) continue;
             if (plate_printable_bbox.defined) {
                 if (!plate_printable_bbox.contains(bbox)) { // out of the bed area
                     m_result.gcode_check_result.error_code |= (1<<2);

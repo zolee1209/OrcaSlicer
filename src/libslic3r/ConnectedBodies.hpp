@@ -2,6 +2,7 @@
 
 #include "BoundingBox.hpp"
 #include "ExPolygon.hpp"
+#include "ForkRingIndex.hpp" // FORK(perf-gcode-processor)
 #include "Point.hpp"
 #include "Polygon.hpp"
 #include "TriangleMesh.hpp"
@@ -38,6 +39,11 @@ private:
     const ExPolygons        *m_islands;
     std::vector<BoundingBox> m_boxes;
     std::vector<bool>        m_alone;
+    // FORK(perf-gcode-processor) BEGIN: ExPolygon::contains() of large islands through a lazily built edge index.
+    // Not thread safe: the G-code processor's mass locator calls the locator serially.
+    bool                                        island_contains(size_t island, const Point &point) const;
+    mutable std::vector<ExPolygonContainsIndex> m_contains_index;
+    // FORK(perf-gcode-processor) END
 };
 
 using MeshInPlace = std::pair<const indexed_triangle_set *, Transform3d>;
