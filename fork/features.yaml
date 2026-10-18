@@ -421,3 +421,10 @@ features:
     hooks: [.gitignore]
     commits: [477f05313c, 5fa2ffd30a]
     test: null
+    notes: >
+      2026-10-18: teljesítménymérő eszközök. fork/tools/bench.py (run/compare/list: rögzített process-profil
+      fork/bench/process/helmet-tree.json, medián N futásból, fázis-jelek, [fork-perf]/[fork-exp] sorok, CPU/fázis pidstat-tal,
+      geometriai digest a "; " kommentek és a --parallel _SUPP_INTERFACE_FAN zaj nélkül, kimenet build/bench/ alá, a nagy
+      fájlok törlésével) és fork/tools/gprof-report.py (gperftools CPU-profil szimbolizálása nm-mel: flat/cum, --callers,
+      --within). Profilozás perf/sudo/ptrace nélkül: LD_PRELOAD="libgcc_s.so.1 libprofiler.so.0" (a libgcc_s előre kell,
+      különben a libprofiler által behúzott libunwind miatt az első C++ kivételnél SIGSEGV). Feltétel: nem strippelt bináris.

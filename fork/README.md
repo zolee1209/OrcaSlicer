@@ -9,6 +9,8 @@ A mappa nincs upstreamben, ezért rebase-nél soha nem ütközik.
 - `features.yaml` – **a hiteles nyilvántartás**: saját funkciók (fájlok, CLI-opciók, döntések, rebase-szabályok),
   szinkron-beállítások, védett fájlok, profilszabályok.
 - `tools/` – determinisztikus scriptek (Python 3 + PyYAML), lásd lent.
+- `bench/process/` – rögzített process-profil(ok) a teljesítményméréshez (a felhasználói profil változása ne torzítsa a mérést).
+- `perf/` – teljesítmény-elemzések, mérési jegyzőkönyvek.
 - `upstream-sync/<dátum>/` – egy-egy szinkronizációs kör anyaga
   - `upstream-changes.md` – a mainline változásai magyarul, témák szerint, ⚠️ = fork-releváns
   - `rebase-trial-notes.md` / `rebase-notes.md` – rebase-jegyzőkönyv
@@ -30,6 +32,22 @@ python3 fork/tools/prune-profiles.py --resolve-conflicts --apply     # rebase k�
 python3 fork/tools/prune-profiles.py --prune --apply                 # más gyártók törlése
 python3 fork/tools/prune-profiles.py --restore-ratrig <ref> --apply  # Ratrig = fork verziója
 ```
+
+## Teljesítménymérés
+
+```bash
+python3 fork/tools/bench.py run base --runs 3 --cpu          # helmet + tree support referencia, medián, CPU/fázis
+python3 fork/tools/bench.py run proto --runs 3 --env ORCA_X=1 # ugyanez környezeti kapcsolóval
+python3 fork/tools/bench.py compare base proto               # idők + geometriai digest (AZONOS/ELTÉR)
+python3 fork/tools/bench.py run prof --profile               # gperftools CPU-profil (perf/sudo nélkül)
+python3 fork/tools/gprof-report.py build/src/Release/orca-slicer build/bench/prof/run-1/cpu.prof --top 40 [--cum|--callers RE|--within RE]
+```
+
+- Kimenet: `build/bench/<címke>/` (nem tmpfs; a G-code/.moves futás után törlődik, `--keep` megtartja).
+- Időmérők a kódban: `src/libslic3r/ForkPerfTimer.hpp` (`ForkPerfScope`), log: `[fork-perf] <név>: <ms> ms`
+  (`--debug 4`); a bench.py ezeket gyűjti.
+- Profilozáshoz nem strippelt bináris kell (sima `ninja -f build-Release.ninja orca-slicer`; a `build_linux.sh -x` strippel).
+- Zaj ezen a gépen ~±4%: döntéshez `--runs 3`.
 
 ## Konvenciók
 
