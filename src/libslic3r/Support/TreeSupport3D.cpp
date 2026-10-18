@@ -35,6 +35,7 @@
 #include "libslic3r/Surface.hpp"
 #include "TriangleMeshSlicer.hpp"
 #include "TreeSupport.hpp"
+#include "TreeSupport3DPerf.hpp" // FORK(perf-tree-support)
 #include "I18N.hpp"
 #include "libslic3r/libslic3r.h"
 #include "libslic3r/Utils.hpp"
@@ -2222,6 +2223,11 @@ static bool merge_influence_areas_two_elements(
                 2 * (config.xy_distance + smaller_collision_radius - 3), 0, 0),
             bigger);
     };
+    // FORK(perf-tree-support): ~80% of the pairs reaching this point are rejected below; skip them cheaply.
+    if (merge_overlap_impossible(merging_to_bp ? smaller_rad.areas.to_bp_areas : smaller_rad.areas.to_model_areas,
+                                 merging_to_bp ? bigger_rad.areas.to_bp_areas : bigger_rad.areas.to_model_areas,
+                                 real_radius_delta, 2 * (config.xy_distance + smaller_collision_radius - 3)))
+        return false;
 //#define TREES_MERGE_RATHER_LATER
     Polygons intersect = 
 #ifdef TREES_MERGE_RATHER_LATER
@@ -4254,10 +4260,11 @@ void organic_draw_branches(
                                                     if (!src.empty() || has_bottom_contacts) {
                                                         Slice &dst = tree.slices[i - new_begin];
                                                         if (++ dst.num_branches > 1) {
+                                                            // FORK(perf-tree-support): append_geometric, append() is quadratic here.
                                                             if (!src.empty())
-                                                                append(dst.polygons, std::move(src));
+                                                                append_geometric(dst.polygons, std::move(src));
                                                             if (has_bottom_contacts)
-                                                                append(dst.bottom_contacts, std::move(bottom_contacts[j]));
+                                                                append_geometric(dst.bottom_contacts, std::move(bottom_contacts[j]));
                                                         } else {
                                                             if (!src.empty())
                                                                 dst.polygons = std::move(src);
@@ -4278,24 +4285,30 @@ void organic_draw_branches(
     fork_perf_log("tree support: draw branches", fork_perf_ms_since(perf_t)); // FORK(perf-phase-timers)
     perf_t = ForkPerfClock::now(); // FORK(perf-phase-timers)
 
-    tbb::parallel_for(tbb::blocked_range<size_t>(0, trees.size(), 1),
-        [&trees, &throw_on_cancel](const tbb::blocked_range<size_t> &range) {
-        for (size_t tree_id = range.begin(); tree_id < range.end(); ++ tree_id) {
-            Tree &tree = trees[tree_id];
+    // FORK(perf-tree-support) BEGIN: one task per (tree, slice) instead of one per tree, so that a giant tree
+    // does not union all its layers on a single core. Each slice is unioned exactly as before.
+    {
+        std::vector<Slice*> slices_to_union;
+        for (Tree &tree : trees)
             for (Slice &slice : tree.slices)
-                if (slice.num_branches > 1) {
-                    // ORCA: avoid union_ on empty containers.
-                    if (!slice.polygons.empty())
-                        slice.polygons = union_(slice.polygons);
-                    if (!slice.bottom_contacts.empty())
-                        slice.bottom_contacts = union_(slice.bottom_contacts);
+                if (slice.num_branches > 1)
+                    slices_to_union.emplace_back(&slice);
+        tbb::parallel_for(tbb::blocked_range<size_t>(0, slices_to_union.size(), 1),
+            [&slices_to_union, &throw_on_cancel](const tbb::blocked_range<size_t> &range) {
+            for (size_t i = range.begin(); i < range.end(); ++ i) {
+                Slice &slice = *slices_to_union[i];
+                // ORCA: avoid union_ on empty containers.
+                if (!slice.polygons.empty())
+                    slice.polygons = union_(slice.polygons);
+                if (!slice.bottom_contacts.empty())
+                    slice.bottom_contacts = union_(slice.bottom_contacts);
 
-                    slice.num_branches = 1;
-                }
-
-            throw_on_cancel();
-        }
-    }, tbb::simple_partitioner());
+                slice.num_branches = 1;
+                throw_on_cancel();
+            }
+        });
+    }
+    // FORK(perf-tree-support) END
     fork_perf_log("tree support: per-tree union", fork_perf_ms_since(perf_t)); // FORK(perf-phase-timers)
     perf_t = ForkPerfClock::now(); // FORK(perf-phase-timers)
 
@@ -4316,10 +4329,11 @@ void organic_draw_branches(
                     Slice &dst = slices[i];
 
                     if (++ dst.num_branches > 1) {
+                        // FORK(perf-tree-support): append_geometric, append() is quadratic here.
                         if (!src.polygons.empty())
-                            append(dst.polygons, std::move(src.polygons));
+                            append_geometric(dst.polygons, std::move(src.polygons));
                         if (has_bottom_contacts)
-                            append(dst.bottom_contacts, std::move(src.bottom_contacts));
+                            append_geometric(dst.bottom_contacts, std::move(src.bottom_contacts));
                     } else {
                         if (!src.polygons.empty())
                             dst.polygons = std::move(src.polygons);

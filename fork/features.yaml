@@ -245,6 +245,25 @@ features:
     commits: [df069a9438]
     test: null
 
+  - id: perf-tree-support
+    name: Kimenet-azonos gyorsítások az organic tree support generátorban (merge előszűrő, lineáris append, lapított unió)
+    status: fork-only
+    owned_files: [src/libslic3r/Support/TreeSupport3DPerf.hpp]
+    hooks: [src/libslic3r/Support/TreeSupport3D.cpp]
+    commits: []
+    test: null
+    notes: >
+      2026-10-18, mérés: helmet referencia (fork/tools/bench.py), a G-code geometriája bitazonos. 1) merge_influence_areas_two_elements:
+      konzervatív előszűrő (merge_overlap_impossible: jtSquare offset ⊇ jtRound offset + simplify/kerekítés ráhagyás) a drága
+      safe_offset_inc + intersection előtt; a bbox után megmaradó párok ~79%-át kiszűri; merge 73 s → 14 s. Egy ellenőrző
+      módban 1,5 M elutasításból 0 eltért a pontos teszttől, miután a Clipper2 jtSquare által eldobott mikro-komponenseket
+      ((0,1 mm)² alatt) a pontos tesztre engedtük. 2) organic_draw_branches: append() pontos reserve-je fánként/rétegenként
+      kvadratikus (újrafoglalás + mélymásolás, mert a Polygon move ctor nem noexcept) → append_geometric; 34,6 s → 0,8 s.
+      3) fánkénti unió (tree, slice) párokra lapított parallel_for-ral (egy óriásfa nem fut egy magon); 17,0 s → 3,1 s.
+      A noexcept move ctor (MultiPoint/Polygon/Polyline) kipróbálva: mérhetetlen nyereség, ezért nincs benne.
+      Nyitott (külön feladat): clip_clipper_polygons_with_subject_bbox – 8 M hívás 13,8 milliárd csúcsot olvas, ebből 0,4%
+      marad; poligononkénti szakasz-bbox index kellene a TreeModelVolumes cache-ben (invazív), becslés ~3–4 s.
+
   - id: perf-phase-timers
     name: Fázis-időmérők a G-code exporthoz és a GUI előnézet-betöltéshez ([fork-perf] info log)
     status: fork-only
