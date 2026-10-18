@@ -509,6 +509,10 @@ void GCodeProcessor::TimeMachine::calculate_time(GCodeProcessorResult& result, P
         additional_buffer.emplace_back(target_move_type, additional_time);
     additional_buffer = merge_adjacent_additional_time_blocks(additional_buffer);
 
+    // FORK(klipper-time-estimate) BEGIN: a Klipper machine is planned by Klipper's own look-ahead
+    const size_t klipper_n_blocks_process = klipper_planner ? KlipperPlanner::plan_time_blocks(blocks, keep_last_n_blocks) : 0;
+    if (!klipper_planner) {
+    // FORK(klipper-time-estimate) END
     // reverse_pass
     for (int i = static_cast<int>(blocks.size()) - 1; i > 0; --i) {
         planner_reverse_pass_kernel(blocks[i - 1], blocks[i]);
@@ -520,8 +524,10 @@ void GCodeProcessor::TimeMachine::calculate_time(GCodeProcessorResult& result, P
     }
 
     recalculate_trapezoids(blocks);
+    } // FORK(klipper-time-estimate)
 
-    const size_t n_blocks_process = blocks.size() - keep_last_n_blocks;
+    const size_t n_blocks_process = klipper_planner ? klipper_n_blocks_process : // FORK(klipper-time-estimate)
+                                    blocks.size() - keep_last_n_blocks;
     size_t additional_buffer_idx = 0;
     for (size_t i = 0; i < n_blocks_process; ++i) {
         const TimeBlock& block = blocks[i];
@@ -3568,6 +3574,13 @@ void GCodeProcessor::apply_config(const DynamicPrintConfig& config)
         const ConfigOptionFloats* machine_min_travel_rate = config.option<ConfigOptionFloats>("machine_min_travel_rate");
         if (machine_min_travel_rate != nullptr)
             m_time_processor.machine_limits.machine_min_travel_rate.values = machine_min_travel_rate->values;
+
+        // FORK(klipper-time-estimate) BEGIN
+        if (const ConfigOptionFloat* mcr = config.option<ConfigOptionFloat>("machine_minimum_cruise_ratio"); mcr != nullptr)
+            m_time_processor.machine_limits.machine_minimum_cruise_ratio.value = mcr->value;
+        if (const ConfigOptionFloat* icv = config.option<ConfigOptionFloat>("machine_instantaneous_corner_velocity"); icv != nullptr)
+            m_time_processor.machine_limits.machine_instantaneous_corner_velocity.value = icv->value;
+        // FORK(klipper-time-estimate) END
     }
 
     for (size_t i = 0; i < static_cast<size_t>(PrintEstimatedStatistics::ETimeMode::Count); ++i) {
@@ -5267,7 +5280,8 @@ void GCodeProcessor::process_G1(const std::array<std::optional<double>, 4>& axes
 
         //BBS: limite the cruise according to centripetal acceleration
         //Only need to handle when both prev and curr segment has movement in x-y plane
-        if ((prev.exit_direction(0) != 0.0f || prev.exit_direction(1) != 0.0f) &&
+        if (m_flavor != gcfKlipper && // FORK(klipper-time-estimate): Klipper limits the junctions instead (KlipperPlanner)
+            (prev.exit_direction(0) != 0.0f || prev.exit_direction(1) != 0.0f) &&
             (curr.enter_direction(0) != 0.0f || curr.enter_direction(1) != 0.0f)) {
             Vec3f v1 = prev.exit_direction;
             v1(2, 0) = 0.0f;
@@ -5446,6 +5460,10 @@ void GCodeProcessor::process_G1(const std::array<std::optional<double>, 4>& axes
 
         // calculates block trapezoid
         block.calculate_trapezoid();
+
+        // FORK(klipper-time-estimate): Klipper's own junction limits, planned in calculate_time()
+        if (m_flavor == gcfKlipper)
+            klipper_init_block(block, delta_pos, type, i);
 
         // updates previous
         prev = curr;
@@ -6624,6 +6642,7 @@ void GCodeProcessor::process_SET_VELOCITY_LIMIT(const GCodeReader::GCodeLine& li
         }
     }
 
+    klipper_process_set_velocity_limit(line); // FORK(klipper-time-estimate): MINIMUM_CRUISE_RATIO / ACCEL_TO_DECEL
 }
 
 void GCodeProcessor::process_M221(const GCodeReader::GCodeLine& line)
@@ -7739,6 +7758,7 @@ void GCodeProcessor::calculate_time(GCodeProcessorResult& result, size_t keep_la
     std::vector<TimeMachine::ActualSpeedMove> actual_speed_moves;
     for (size_t i = 0; i < static_cast<size_t>(PrintEstimatedStatistics::ETimeMode::Count); ++i) {
         TimeMachine& machine = m_time_processor.machines[i];
+        machine.klipper_planner = (m_flavor == gcfKlipper); // FORK(klipper-time-estimate)
         machine.calculate_time(m_result, static_cast<PrintEstimatedStatistics::ETimeMode>(i), keep_last_n_blocks, additional_time, target_move_type, is_final);
         if (static_cast<PrintEstimatedStatistics::ETimeMode>(i) == PrintEstimatedStatistics::ETimeMode::Normal)
             actual_speed_moves = std::move(machine.actual_speed_moves);

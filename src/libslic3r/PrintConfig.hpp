@@ -1652,6 +1652,10 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionFloats,               machine_max_jerk_e))
     // M205 J... [mm]
     ((ConfigOptionFloats,               machine_max_junction_deviation))
+    // FORK(klipper-time-estimate) BEGIN: Klipper look-ahead parameters, time estimate only
+    ((ConfigOptionFloat,                machine_minimum_cruise_ratio))
+    ((ConfigOptionFloat,                machine_instantaneous_corner_velocity))
+    // FORK(klipper-time-estimate) END
     // M205 T... [mm/sec]
     ((ConfigOptionFloats,               machine_min_travel_rate))
     // M205 S... [mm/sec]

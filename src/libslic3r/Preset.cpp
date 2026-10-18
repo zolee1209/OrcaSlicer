@@ -1558,6 +1558,7 @@ static std::vector<std::string> s_Preset_machine_limits_options {
     "machine_min_extruding_rate", "machine_min_travel_rate",
     "machine_max_jerk_x", "machine_max_jerk_y", "machine_max_jerk_z", "machine_max_jerk_e",
     "machine_max_junction_deviation",
+    "machine_minimum_cruise_ratio", "machine_instantaneous_corner_velocity", // FORK(klipper-time-estimate)
     // Bedslinger mass/force limits
     "machine_max_force_Y", "machine_bed_mass_Y", "machine_max_printed_mass",
     //resonance avoidance ported from qidi slicer

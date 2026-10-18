@@ -305,6 +305,8 @@ bool Print::invalidate_state_by_config_options(const ConfigOptionResolver & /* n
         "use_relative_e_distances",
         "accel_to_decel_enable",
         "accel_to_decel_factor",
+        "machine_minimum_cruise_ratio",          // FORK(klipper-time-estimate)
+        "machine_instantaneous_corner_velocity", // FORK(klipper-time-estimate)
         "wipe_on_loops",
         "wipe_inward",
         "wipe_inward_distance",

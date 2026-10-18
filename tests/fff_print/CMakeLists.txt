@@ -10,6 +10,8 @@ add_executable(${_TEST_NAME}_tests
 	test_flow.cpp
 	test_gcode_processor.cpp
 	test_gcode_timing.cpp
+	# FORK(klipper-time-estimate)
+	test_klipper_planner.cpp
 	test_gcode.cpp
 	test_gcodeprocessor.cpp
 	test_gcodewriter.cpp

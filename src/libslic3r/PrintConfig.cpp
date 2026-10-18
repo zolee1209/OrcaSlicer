@@ -5359,6 +5359,32 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionFloats{ 0.01f });
 
+    // FORK(klipper-time-estimate) BEGIN
+    def = this->add("machine_minimum_cruise_ratio", coFloat);
+    def->label = L("Minimum cruise ratio");
+    def->full_label = L("Minimum cruise ratio");
+    def->category = L("Machine limits");
+    def->tooltip = L("Klipper's minimum_cruise_ratio from printer.cfg: the share of a move that must be traveled at cruise speed, "
+                     "which lowers the top speed of short moves. Used only by the print time estimate of Klipper printers.\n"
+                     "SET_VELOCITY_LIMIT MINIMUM_CRUISE_RATIO in the G-code overrides it, and so does ACCEL_TO_DECEL "
+                     "(written by the process option \"accel_to_decel\": a value of N% equals a ratio of 1 - N/100).");
+    def->min = 0.f;
+    def->max = 0.99f;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0.5));
+
+    def = this->add("machine_instantaneous_corner_velocity", coFloat);
+    def->label = L("Instantaneous corner velocity");
+    def->full_label = L("Instantaneous corner velocity");
+    def->category = L("Machine limits");
+    def->tooltip = L("Klipper's instantaneous_corner_velocity from the [extruder] section of printer.cfg: the largest instant "
+                     "change of extruder speed at a corner. Used only by the print time estimate of Klipper printers.");
+    def->sidetext = L("mm/s");	// millimeters per second, CIS languages need translation
+    def->min = 0.f;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(1.));
+    // FORK(klipper-time-estimate) END
+
     // M205 S... [mm/sec]
     def = this->add("machine_min_extruding_rate", coFloats);
     def->full_label = L("Minimum speed for extruding");

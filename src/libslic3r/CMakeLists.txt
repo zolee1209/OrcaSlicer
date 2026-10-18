@@ -270,6 +270,9 @@ set(lisbslic3r_sources
     GCode/FanMover.hpp
     GCode/GCodeProcessor.cpp
     GCode/GCodeProcessor.hpp
+    # FORK(klipper-time-estimate)
+    GCode/KlipperPlanner.cpp
+    GCode/KlipperPlanner.hpp
     GCode/ElegooGCodeProcessorHelper.cpp
     GCode.hpp
     GCode/PchipInterpolatorHelper.cpp

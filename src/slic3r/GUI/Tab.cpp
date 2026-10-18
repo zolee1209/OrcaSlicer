@@ -5723,6 +5723,7 @@ PageShp TabPrinter::build_kinematics_page()
         append_option_line(optgroup, "machine_max_acceleration_extruding", "printer_motion_ability#acceleration-limitation");
         append_option_line(optgroup, "machine_max_acceleration_retracting", "printer_motion_ability#acceleration-limitation");
         append_option_line(optgroup, "machine_max_acceleration_travel", "printer_motion_ability#acceleration-limitation");
+        optgroup->append_single_option_line("machine_minimum_cruise_ratio"); // FORK(klipper-time-estimate)
 
         optgroup = page->new_optgroup(L("Jerk limitation"), "param_jerk");
         // machine max junction deviation
@@ -5730,6 +5731,7 @@ PageShp TabPrinter::build_kinematics_page()
         for (const std::string &axis : axes)	{
             append_option_line(optgroup, "machine_max_jerk_" + axis, "printer_motion_ability#maximum-jerk");
         }
+        optgroup->append_single_option_line("machine_instantaneous_corner_velocity"); // FORK(klipper-time-estimate)
 
     //optgroup = page->new_optgroup(L("Minimum feedrates"));
     //    append_option_line(optgroup, "machine_min_extruding_rate");
@@ -6758,6 +6760,10 @@ void TabPrinter::toggle_options()
         for (int i = 0; i < max_field; ++i)
             toggle_option("machine_max_junction_deviation", gcf_is_marlin_firmware, i);
         toggle_line("machine_max_junction_deviation", gcf_is_marlin_firmware);
+        // FORK(klipper-time-estimate) BEGIN
+        toggle_line("machine_minimum_cruise_ratio", gcf_is_klipper);
+        toggle_line("machine_instantaneous_corner_velocity", gcf_is_klipper);
+        // FORK(klipper-time-estimate) END
 
         // Check if junction deviation value is non-zero and firmware is Marlin
         bool enable_jerk = !gcf_is_marlin_firmware;

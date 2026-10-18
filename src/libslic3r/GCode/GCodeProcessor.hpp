@@ -14,6 +14,7 @@
 #include "libslic3r/CustomGCode.hpp"
 #include "libslic3r/MultiNozzleUtils.hpp"
 #include "libslic3r/GCode/MachineFrameTransform.hpp"
+#include "libslic3r/GCode/KlipperPlanner.hpp" // FORK(klipper-time-estimate)
 
 #include <cstddef>
 #include <cassert>
@@ -697,6 +698,7 @@ inline constexpr float DEFAULT_FILAMENT_DENSITY = 1.245f;
             Flags flags;
             FeedrateProfile feedrate_profile;
             Trapezoid trapezoid;
+            KlipperPlanner::Move klipper; // FORK(klipper-time-estimate): look-ahead state on a Klipper machine
 
             // Calculates this block's trapezoid
             void calculate_trapezoid();
@@ -763,6 +765,7 @@ inline constexpr float DEFAULT_FILAMENT_DENSITY = 1.245f;
             };
 
             bool enabled;
+            bool klipper_planner{ false }; // FORK(klipper-time-estimate): plan with Klipper's look-ahead
             float acceleration; // mm/s^2
             // hard limit for the acceleration, to which the firmware will clamp.
             float max_acceleration; // mm/s^2
@@ -1529,6 +1532,10 @@ inline constexpr float DEFAULT_FILAMENT_DENSITY = 1.245f;
 
         // Klipper SET_VELOCITY_LIMIT
         void process_SET_VELOCITY_LIMIT(const GCodeReader::GCodeLine& line);
+        // FORK(klipper-time-estimate) BEGIN: defined in KlipperPlanner.cpp
+        void klipper_process_set_velocity_limit(const GCodeReader::GCodeLine& line);
+        void klipper_init_block(TimeBlock& block, const AxisCoords& delta_pos, EMoveType type, size_t mode_id) const;
+        // FORK(klipper-time-estimate) END
 
         // Set extrude factor override percentage
         void process_M221(const GCodeReader::GCodeLine& line);

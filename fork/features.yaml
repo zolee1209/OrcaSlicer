@@ -229,6 +229,33 @@ features:
       Referencia (PLA) szeletelés geometriáját menti, a többi filament ugyanarra a kombinációra
       visszatölti újraszeletelés helyett. Bináris, rétegenként/régiónként párhuzamos formátum.
 
+  - id: klipper-time-estimate
+    name: Klipper-hű időbecslés – a Klipper toolhead.py look-ahead tervezőjének portja (gcode_flavor = klipper)
+    status: fork-only
+    owned_files: [src/libslic3r/GCode/KlipperPlanner.cpp, src/libslic3r/GCode/KlipperPlanner.hpp, tests/fff_print/test_klipper_planner.cpp]
+    hooks: [src/libslic3r/GCode/GCodeProcessor.cpp, src/libslic3r/GCode/GCodeProcessor.hpp, src/libslic3r/PrintConfig.cpp, src/libslic3r/PrintConfig.hpp, src/libslic3r/Preset.cpp, src/libslic3r/Print.cpp, src/libslic3r/CMakeLists.txt, src/slic3r/GUI/Tab.cpp, tests/fff_print/CMakeLists.txt]
+    config: [machine_minimum_cruise_ratio (printer, alap 0.5), machine_instantaneous_corner_velocity (printer, alap 1.0 mm/s)]
+    commits: []
+    used_by: [utils/reslice_free_recalc.py (--gcode-stats), minden szeletelés becsült ideje és M73 sorai]
+    test: tests/fff_print/test_klipper_planner.cpp ("[Klipper]")
+    notes: >
+      Ok (mérés 2026-10-18, RatRig V-Core 4, Klipper v0.12.0-402-g2817b348, Benchy, print_duration):
+      retract/Z-hop nélkül valós 36:53, Orca 35:30 → 36:53,75; retract+Z-hoppal valós 43:39, Orca 40:32 → 43:39,39
+      (machine_instantaneous_corner_velocity = 5, mint a printer.cfg-ben). Referencia: a Klipper saját toolhead.py
+      Move/LookAheadQueue kódja ugyanazon a G-code-on ±0,03 s-ra egyezik a porttal. Az eltérés okai a régi
+      (Marlin-szerű) tervezőben: minimum_cruise_ratio hiánya (~80 s), junction deviation a blokk saját, tengelyre
+      korlátozott gyorsulásával (Z-hop sarok 5 mm/s helyett ~1-2 mm/s, csak-E mozgás nyugalomból) (~90 s),
+      extruder instantaneous_corner_velocity hiánya (~6 s ICV=1-nél), BBS centripetális cruise-korlát (Klipperben nincs;
+      Klipper junction-szintű centripetális korlátja a helyette). A Klipper-verzió (2817b348) az ACCEL_TO_DECEL-t
+      natívan MCR = 1 − ACCEL_TO_DECEL/ACCEL-ként kezeli (RatOS makró ugyanígy) → az Orca process "accel_to_decel"
+      opciója (pl. 50%) a G-code-on át felülírja a machine_minimum_cruise_ratio-t (0,5). Az újabb mainline Klipper
+      az ACCEL_TO_DECEL-t már nem fogadja; ott a printer-beállítás vagy MINIMUM_CRUISE_RATIO számít.
+      A klipper_estimator (v3.7.3) csak-E mozgásra nem alkalmaz MCR-t (−14 s ezen a mérésen) → nem etalon.
+      Csak a Klipper flavort érinti; más flavor becslése bitazonos (marlin, marlin2, reprapfirmware ellenőrizve).
+      Lazy flush az Orca 256/64-es ablakával; a Klipper-referencián a flush-ütemezés nem befolyásolja az eredményt.
+      Ismert, nem modellezett: makrók (START_PRINT/END_PRINT) ideje, gazdagép/MCU-késleltetés, max_velocity vektor-
+      korlát (Orca tengelyenkénti machine_max_speed_x/y), az első SET_VELOCITY_LIMIT előtti travel-gyorsulás (Orca 1250).
+
   # ---------------------------------------------------------------- Teljesítmény / javítás
 
   - id: perf-brim-bbox
