@@ -3738,9 +3738,9 @@ static void recover_pending_branch_roofs(
 // FORK(tree-support-fast-draw): the per-branch pipeline below (triangulate the tube, slice it,
 // clip against collision/bed/belt, derive bottom contacts, recover any pending branch roof, and
 // trim trailing empty slices) used to live inline inside the per-tree tbb::parallel_for in
-// organic_draw_branches(). It is now a standalone function shared by both the stock per-tree task
-// granularity and the tree_support_fast_mode per-branch-flattened one below, so the two paths stay
-// logically identical by construction; only the task scheduling differs.
+// organic_draw_branches(). It is now a standalone function, called per branch from one flat
+// tbb::parallel_for over all branches of all trees (the stock code ran one task per tree, which left
+// one or two giant trees on a single core); the per-branch work is the same, only the scheduling differs.
 // Moved out of organic_draw_branches() (where it used to be declared as a local struct) so that
 // draw_branch_slices() below can reference it too.
 struct Branch {
@@ -4179,7 +4179,6 @@ void organic_draw_branches(
     fork_perf_log("tree support: collect trees", fork_perf_ms_since(perf_t)); // FORK(perf-phase-timers)
     perf_t = ForkPerfClock::now(); // FORK(perf-phase-timers)
 // FORK(tree-support-fast-draw) BEGIN
-    if (print_object.config().tree_support_fast_mode.value) {
     {
         struct BranchWorkItem { size_t tree_id; size_t branch_idx; };
         std::vector<BranchWorkItem> work_items;
@@ -4274,65 +4273,6 @@ void organic_draw_branches(
                     }
                 }
             }, tbb::simple_partitioner());
-    }
-    } else {
-    tbb::parallel_for(tbb::blocked_range<size_t>(0, trees.size(), 1),
-        [&trees, &volumes, &config, &slicing_params, &move_bounds, &mesh_slicing_params, &interface_placer, &throw_on_cancel](const tbb::blocked_range<size_t> &range) {
-            indexed_triangle_set    partial_mesh;
-            std::vector<float>      slice_z;
-            for (size_t tree_id = range.begin(); tree_id < range.end(); ++ tree_id) {
-                Tree &tree = trees[tree_id];
-                for (const Branch &branch : tree.branches) {
-                    BranchDrawResult draw_result = draw_branch_slices(branch, volumes, config, slicing_params, move_bounds,
-                        mesh_slicing_params, interface_placer, throw_on_cancel, partial_mesh, slice_z);
-                    LayerIndex              layer_begin      = draw_result.layer_begin;
-                    LayerIndex              layer_end        = draw_result.layer_end;
-                    std::vector<Polygons>  &slices           = draw_result.slices;
-                    std::vector<Polygons>  &bottom_contacts  = draw_result.bottom_contacts;
-
-                                        if (layer_begin < layer_end) {
-                                            LayerIndex new_begin = tree.first_layer_id == -1 ? layer_begin : std::min(tree.first_layer_id, layer_begin);
-                                            LayerIndex new_end   = tree.first_layer_id == -1 ? layer_end : std::max(tree.first_layer_id + LayerIndex(tree.slices.size()), layer_end);
-                                            size_t     new_size  = size_t(new_end - new_begin);
-                                            if (tree.first_layer_id == -1) {
-                                            } else if (tree.slices.capacity() < new_size) {
-                                                std::vector<Slice> new_slices;
-                                                new_slices.reserve(new_size);
-                                                if (LayerIndex dif = tree.first_layer_id - new_begin; dif > 0)
-                                                    new_slices.insert(new_slices.end(), dif, {});
-                                                append(new_slices, std::move(tree.slices));
-                                                tree.slices.swap(new_slices);
-                                            } else if (LayerIndex dif = tree.first_layer_id - new_begin; dif > 0)
-                                                tree.slices.insert(tree.slices.begin(), tree.first_layer_id - new_begin, {});
-                                            tree.slices.insert(tree.slices.end(), new_size - tree.slices.size(), {});
-                                            for (LayerIndex i = layer_begin; i != layer_end; ++ i) {
-                                                int j = i - layer_begin;
-                                                Polygons &src = slices[j];
-                                                bool has_bottom_contacts = j < int(bottom_contacts.size()) && !bottom_contacts[j].empty();
-
-                                                // ORCA: preserve bottom contacts even if base polygons are empty.
-                                                if (!src.empty() || has_bottom_contacts) {
-                                                    Slice &dst = tree.slices[i - new_begin];
-                                                    if (++ dst.num_branches > 1) {
-                                                        if (!src.empty())
-                                                            append(dst.polygons, std::move(src));
-                                                        if (has_bottom_contacts)
-                                                            append(dst.bottom_contacts, std::move(bottom_contacts[j]));
-                                                    } else {
-                                                        if (!src.empty())
-                                                            dst.polygons = std::move(src);
-                                                        if (has_bottom_contacts)
-                                                            dst.bottom_contacts = std::move(bottom_contacts[j]);
-                                                    }
-                                                }
-                                            }
-
-                                            tree.first_layer_id = new_begin;
-                                        }
-
-                }
-            }
-        }, tbb::simple_partitioner());
     }
     // FORK(tree-support-fast-draw) END
     fork_perf_log("tree support: draw branches", fork_perf_ms_since(perf_t)); // FORK(perf-phase-timers)

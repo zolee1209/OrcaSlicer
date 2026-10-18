@@ -760,11 +760,10 @@ void TreeSupport::detect_overhangs(bool check_support_necessity/* = false*/)
     const bool support_critical_regions_only = config.support_critical_regions_only.value;
     bool config_remove_small_overhangs = config.support_remove_small_overhang.value;
     bool config_detect_sharp_tails = g_config_support_sharp_tails;
-    // FORK(tree-support-fast-draw): parallelize the sub-loops below that have no cross-layer /
-    // cross-cluster data dependency. The sharp-tail accumulation loop (reads the previous layer's
+    // FORK(tree-support-fast-draw): the sub-loops below that have no cross-layer / cross-cluster data
+    // dependency run in parallel. The sharp-tail accumulation loop (reads the previous layer's
     // just-computed result) and the cluster-building loop (sequential insertion into a growing
-    // list) keep their current serial form either way.
-    const bool fast_mode = config.tree_support_fast_mode.value;
+    // list) keep their serial form.
     const int enforce_support_layers = config.enforce_support_layers.value;
     const double area_thresh_well_supported = SQ(scale_(6));
     const double length_thresh_well_supported = scale_(6);
@@ -1189,15 +1188,11 @@ void TreeSupport::detect_overhangs(bool check_support_necessity/* = false*/)
                 { cluster.is_cantilever? layer1->cantilevers: offset_ex(cluster.merged_poly, -1 * extrusion_width_scaled), {cluster.is_cantilever ? "cantilever":"erode1","green",0.5}} });
 #endif
         };
-        if (fast_mode)
-            tbb::parallel_for(tbb::blocked_range<size_t>(0, overhangClusters.size()),
-                [&](const tbb::blocked_range<size_t> &range) {
-                    for (size_t i = range.begin(); i < range.end(); ++i)
-                        process_cluster(overhangClusters[i]);
-                });
-        else
-            for (auto& cluster : overhangClusters)
-                process_cluster(cluster);
+        tbb::parallel_for(tbb::blocked_range<size_t>(0, overhangClusters.size()),
+            [&](const tbb::blocked_range<size_t> &range) {
+                for (size_t i = range.begin(); i < range.end(); ++i)
+                    process_cluster(overhangClusters[i]);
+            });
         // FORK(tree-support-fast-draw) END
     }
 
@@ -1294,7 +1289,7 @@ void TreeSupport::detect_overhangs(bool check_support_necessity/* = false*/)
         return { !layer->loverhangs.empty(), nEnforced > 0, !layer->cantilevers.empty() };
     };
 
-    if (fast_mode) {
+    {
         std::atomic<int>    atomic_layers_with_overhangs{0};
         std::atomic<int>    atomic_layers_with_enforcers{0};
         std::atomic<bool>   atomic_has_cantilever{has_cantilever};
@@ -1349,20 +1344,6 @@ void TreeSupport::detect_overhangs(bool check_support_necessity/* = false*/)
         has_cantilever           = atomic_has_cantilever.load();
         has_sharp_tails          = atomic_has_sharp_tails.load();
         m_highest_overhang_layer = atomic_highest_overhang_layer.load();
-    } else {
-        for (int layer_nr = 0; layer_nr < m_object->layer_count(); layer_nr++) {
-            if (m_object->print()->canceled())
-                break;
-            auto [has_overhangs, has_enforcers, layer_cantilever] = process_overhang_layer(layer_nr, nullptr, nullptr);
-            if (has_overhangs) {
-                layers_with_overhangs++;
-                m_highest_overhang_layer = std::max(m_highest_overhang_layer, size_t(layer_nr));
-            }
-            if (has_enforcers)
-                layers_with_enforcers++;
-            if (layer_cantilever)
-                has_cantilever = true;
-        }
     }
     // FORK(tree-support-fast-draw) END
 
