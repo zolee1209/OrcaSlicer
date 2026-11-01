@@ -216,6 +216,10 @@ features:
       a progress a kiírásból jön (nincs néma farok az utolsó réteg után); a kész klónok azonnal felszabadulnak.
       ORCA_PARALLEL_WAVES (alap 3; 1 = a régi egyhullámú elrendezés). Teszt: Benchy x100 becsült idő
       soros +3 s / 2 nap 10 óra; többszínű IDEX (Benchy x120 ABS + 1.stl x5 PETG) T0/T1 és torony azonos, +2 s.
+      2026-11-01 javítás (fix/parallel-tree-hybrid-support-layers): tree hybrid (önálló support rétegmagasság) mellett a
+      support-only rétegek eltűntek, mert a CoolingBuffer őket a következő objektumrétegig tartja vissza, és a chunk
+      végén a klón puffere elveszett. A chunk-határok most olyan rétegre esnek, ami után a puffer ürül (objektum- vagy
+      raft-réteg), plusz biztonsági flush a chunk végén. Teszt: Benchy + tree(auto)/tree_hybrid, a ;Z: lista azonos a soros úttal.
 
   - id: slicedata-cache
     name: --export-slicedata / --load-slicedata bináris, párhuzamos (de)szerializáció

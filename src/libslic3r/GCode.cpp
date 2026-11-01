@@ -5403,6 +5403,33 @@ void GCode::process_layers_parallel(
     }
     ranges.erase(std::remove_if(ranges.begin(), ranges.end(),
         [](const std::pair<size_t, size_t> &r) { return r.first >= r.second; }), ranges.end());
+
+    // FORK(parallel-gcode-export) BEGIN: the cooling buffer keeps support-only layers (independent
+    // support layer height, e.g. tree hybrid) until the next object layer flushes it, so a chunk must
+    // end right after a layer that flushes it; otherwise the buffered layers die with the chunk's worker.
+    {
+        const auto flushes_cooling_buffer = [&layers_to_print](size_t i) {
+            for (const LayerToPrint &ltp : layers_to_print[i].second) {
+                if (ltp.object_layer != nullptr)
+                    return true;
+                if (ltp.support_layer != nullptr && ltp.support_layer->id() < ltp.support_layer->object()->slicing_parameters().raft_layers())
+                    return true;
+            }
+            return false;
+        };
+        std::vector<size_t> starts { 0 };
+        for (size_t c = 1; c < ranges.size(); ++c) {
+            size_t b = std::max(ranges[c].first, starts.back());
+            while (b < n_layers && !flushes_cooling_buffer(b - 1))
+                ++b;
+            if (b < n_layers && b > starts.back())
+                starts.push_back(b);
+        }
+        ranges.clear();
+        for (size_t c = 0; c < starts.size(); ++c)
+            ranges.emplace_back(starts[c], c + 1 < starts.size() ? starts[c + 1] : n_layers);
+    }
+    // FORK(parallel-gcode-export) END
     const size_t n_real_chunks = ranges.size();
 
     // Prefix count of wipe-tower-active layers, so each chunk can seed its own WipeTowerIntegration
@@ -5463,6 +5490,26 @@ void GCode::process_layers_parallel(
         GCode *worker = (c == 0) ? this : chunk_workers[c].get();
 
         std::string out;
+        // Cooling buffer -> fan mover -> adaptive PA, same order as in the serial pipeline.
+        const auto append_processed = [worker, &out](std::string cooled) {
+            if (worker->m_config.fan_speedup_time.value != 0 || worker->m_config.fan_kickstart.value > 0) {
+                if (worker->m_fan_mover.get() == nullptr)
+                    worker->m_fan_mover.reset(new Slic3r::FanMover(
+                        worker->m_writer,
+                        std::abs((float)worker->m_config.fan_speedup_time.value),
+                        worker->m_config.fan_speedup_time.value > 0,
+                        worker->m_config.use_relative_e_distances.value,
+                        worker->m_config.fan_speedup_overhangs.value,
+                        (float)worker->m_config.fan_kickstart.value));
+                // Flush every call: chunk boundaries are already an accepted discontinuity.
+                cooled = worker->m_fan_mover->process_gcode(cooled, true);
+            }
+            if (worker->m_pa_processor)
+                cooled = worker->m_pa_processor->process_layer(std::move(cooled));
+            out += cooled;
+        };
+        bool   cooling_pending  = false;
+        size_t pending_layer_id = 0;
         // A fresh estimator has no previous layer, so the chunk's first layer would lose its
         // overhang/curled-edge data. Seed it with each object's lower layer, which is what the
         // serial pipeline prepared last in the common case.
@@ -5484,23 +5531,13 @@ void GCode::process_layers_parallel(
                 &print_object_instances_ordering, tool_ordering.get_most_used_extruder(), size_t(-1));
             if (lr.nop_layer_result)
                 continue;
-            std::string cooled = worker->m_cooling_buffer->process_layer(std::move(lr.gcode), lr.layer_id, lr.cooling_buffer_flush);
-            if (worker->m_config.fan_speedup_time.value != 0 || worker->m_config.fan_kickstart.value > 0) {
-                if (worker->m_fan_mover.get() == nullptr)
-                    worker->m_fan_mover.reset(new Slic3r::FanMover(
-                        worker->m_writer,
-                        std::abs((float)worker->m_config.fan_speedup_time.value),
-                        worker->m_config.fan_speedup_time.value > 0,
-                        worker->m_config.use_relative_e_distances.value,
-                        worker->m_config.fan_speedup_overhangs.value,
-                        (float)worker->m_config.fan_kickstart.value));
-                // Flush every call: chunk boundaries are already an accepted discontinuity.
-                cooled = worker->m_fan_mover->process_gcode(cooled, true);
-            }
-            if (worker->m_pa_processor)
-                cooled = worker->m_pa_processor->process_layer(std::move(cooled));
-            out += cooled;
+            pending_layer_id = lr.layer_id;
+            cooling_pending  = !lr.cooling_buffer_flush && (cooling_pending || !lr.gcode.empty());
+            append_processed(worker->m_cooling_buffer->process_layer(std::move(lr.gcode), lr.layer_id, lr.cooling_buffer_flush));
         }
+        // FORK(parallel-gcode-export): safety net, never drop layers still held by the cooling buffer.
+        if (cooling_pending)
+            append_processed(worker->m_cooling_buffer->process_layer({}, pending_layer_id, true));
         // The precomputed data points into this print's layers.
         worker->m_extrusion_quality_estimator.set_precomputed_layers({});
         return out;
