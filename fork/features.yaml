@@ -391,6 +391,23 @@ features:
       modelleknél (helmet) a G-code eltér az upstreamtől, a perf-tree-support "kimenet-azonos" digestje ezzel az ággal nem összevethető.
       Nyitott: ugyanezen a modellen a normal support interface-e z=6,4-től indul, a tree-é z=15-től (más overhang-halmaz) – nem vizsgálva.
 
+  - id: tree-support-no-base-interface
+    name: Tree support – ne legyen "base interface" (adhesion) réteg, ha az interface filament eltér a support filamenttől
+    status: fork-only
+    cli: []
+    config: []
+    hooks: [src/libslic3r/Support/SupportParameters.hpp]
+    commits: []
+    test: null
+    notes: >
+      2026-11-01: upstream (BBS) funkció: eltérő interface/support filamentnél num_top/bottom_base_interface_layers = 1 (adhesion réteg
+      a stack alján, interface mintázattal, de a support filamenttel). Tree supportnál a tip-stackek lejtőn különböző magasságban
+      végződnek, ezért ez a réteg szétszórva, más tip-ek interface-ével keveredve jelent meg (az interface egy része a másik
+      extruderen, egy része a support extruderen). Javítás: is_tree(support_type) esetén 0 (slim/hybrid/organic mind). A
+      non_soluble_base_* (oldódó interface) ág és a normal support változatlan.
+      Mérés (Overhang_test.stl, PLA+ABS, interface filament 2, interface 20 réteg): T1 interface 35 404 → 41 404 mozgás (azonos
+      filamentes referencia: 41 158); normal supportnál a base-interface megmarad.
+
   - id: fix-mmu-unpainted
     name: ModelVolume::get_extruders – festetlen térfogatnál kimarad a TriangleSelector építés
     status: fork-only

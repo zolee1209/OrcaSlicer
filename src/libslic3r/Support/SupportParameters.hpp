@@ -54,18 +54,22 @@ struct SupportParameters {
             bool different_support_interface_filament = object_config.support_interface_filament != 0 &&
                                                        object_config.support_interface_filament != object_config.support_filament;
  
+            // FORK(tree-support-no-base-interface): tree tips end at different heights, so the single adhesion
+            // base-interface layer ends up scattered between interface regions of neighbouring tips. Tree supports
+            // keep the whole interface on the interface filament instead.
+            const bool tree_support = is_tree(object_config.support_type.value);
             if (non_soluble_base_top) { // ORCA: Try to support soluble dense interfaces with non-soluble dense interfaces.
                 this->num_top_base_interface_layers = size_t(std::min(int(num_top_interface_layers) / 2, 2));
             } else {
                 // Keep at least one configured layer on the interface filament.
-                this->num_top_base_interface_layers = different_support_interface_filament && num_top_interface_layers > 1 ? 1 : 0;
+                this->num_top_base_interface_layers = !tree_support && different_support_interface_filament && num_top_interface_layers > 1 ? 1 : 0;
             }
 
             if (non_soluble_base_bottom) { // ORCA: Try to support soluble dense interfaces with non-soluble dense interfaces.
                 this->num_bottom_base_interface_layers = size_t(std::min(int(num_bottom_interface_layers) / 2, 2));
             } else {
                 // Keep at least one configured layer on the interface filament.
-                this->num_bottom_base_interface_layers = different_support_interface_filament && num_bottom_interface_layers > 1 ? 1 : 0;
+                this->num_bottom_base_interface_layers = !tree_support && different_support_interface_filament && num_bottom_interface_layers > 1 ? 1 : 0;
             }
 	    }
         this->first_layer_flow = Slic3r::support_material_1st_layer_flow(&object, float(slicing_params.first_print_layer_height));
