@@ -372,6 +372,25 @@ features:
       15° → csak a 15°-os rész, 20°/25°/26° → 15+20°, 30° → +30°, 45° → +45°; 25° 0,4/0,42/0 szélességgel azonos eredmény.
       Hatóköre: nem-organic és organic tree (mindkettő a TreeSupport::detect_overhangs-t használja).
 
+  - id: tree-support-interface-slopes
+    name: Organic tree support – a tip-ek alá mindig kerüljön interface (ne függjön a tip kör területétől a minimum_roof_area-hoz)
+    status: fork-only
+    cli: []
+    config: []
+    hooks: [src/libslic3r/Support/TreeSupport3D.cpp]
+    commits: []
+    test: null
+    notes: >
+      2026-11-01: hiba: íves/lejtős felület alatt (rétegenkénti vékony overhang-sáv: nincs belőle roof-vonal vagy < 1 mm²) a tree
+      support nem generált interface-t. Ok: generate_initial_areas-ban force_tip_to_roof = roof_enabled && (zero_gap_interface_top ||
+      π·min_radius² > minimum_roof_area (1 mm²)); az alap 0,8 mm-es tip 0,50 mm² → a tip-ek nem kaptak interface-t (a roof-recovery
+      sem indult). Javítás: force_tip_to_roof = roof_enabled. A vízszintes (nagy) roof-út változatlan.
+      Mérés (Overhang_test.stl, RatRig V-Core 4 IDEX 500 0.4 Strong + interface 20 réteg, spacing 0, xy 0,2, tree(auto), küszöb 30):
+      Support interface mozgások 0 → 41 158 (2 rétegnél 10 440); tip 1,2 mm-es régi kóddal 49 745; normal support 16 205.
+      Következmény: minden tip alá interface kerül (több interface anyag, nagyobb tip-folt a levétel helyén) – a nagy kimenetű
+      modelleknél (helmet) a G-code eltér az upstreamtől, a perf-tree-support "kimenet-azonos" digestje ezzel az ággal nem összevethető.
+      Nyitott: ugyanezen a modellen a normal support interface-e z=6,4-től indul, a tree-é z=15-től (más overhang-halmaz) – nem vizsgálva.
+
   - id: fix-mmu-unpainted
     name: ModelVolume::get_extruders – festetlen térfogatnál kimarad a TriangleSelector építés
     status: fork-only
