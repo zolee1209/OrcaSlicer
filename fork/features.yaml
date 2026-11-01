@@ -353,6 +353,25 @@ features:
       nemdeterminizmus: a párhuzamos overhang-fázisban config_detect_sharp_tails=false írás (>100 poligon/réteg
       vagy 30 s) — összevető teszteknél a "detect_overhangs takes more than 30 secs" logsor nem szerepelhet.
 
+  - id: tree-support-small-overhang-fix
+    name: Tree support – sekély lejtőn a "kis overhang" szűrő ne dobja el az összefüggő felületet (klaszter-összekötés a rétegtávolsággal)
+    status: fork-only
+    cli: []
+    config: []
+    hooks: [src/libslic3r/Support/TreeSupport.cpp]
+    commits: []
+    test: null
+    notes: >
+      2026-11-01: hiba: support_remove_small_overhang mellett a sekély lejtő (pl. 15/20°) overhang-sávjai rétegenként
+      lower_layer_offset = layer_height/tan(küszöb+1) távolságra vannak egymástól; ha ez > vonalszélesség (0,2 mm réteg,
+      25° küszöb: 0,41 mm vs 0,4 mm), az OverhangCluster a sávokat nem kötötte össze, minden réteg külön "kis" klaszter lett és
+      kiesett. A vonalszélesség 0 (auto, szélesebb) vagy a szűrő kikapcsolása "megoldotta". Javítás: az OverhangCluster::
+      push_back_if_intersects külön link_offset-et kap (max(vonalszélesség, lower_layer_offset + 0,25·vonalszélesség)) csak az
+      előző réteggel való érintkezés vizsgálatára; a merged_poly tágítása és a kis-overhang méretteszt változatlan.
+      Teszt: Overhang_test.stl, RatRig V-Core 4 IDEX 500 0.4, tree(auto), 0,2 réteg, vonalszélesség 0,4: küszöb 14° → nincs,
+      15° → csak a 15°-os rész, 20°/25°/26° → 15+20°, 30° → +30°, 45° → +45°; 25° 0,4/0,42/0 szélességgel azonos eredmény.
+      Hatóköre: nem-organic és organic tree (mindkettő a TreeSupport::detect_overhangs-t használja).
+
   - id: fix-mmu-unpainted
     name: ModelVolume::get_extruders – festetlen térfogatnál kimarad a TriangleSelector építés
     status: fork-only

@@ -833,7 +833,9 @@ void TreeSupport::detect_overhangs(bool check_support_necessity/* = false*/)
             return overlaps({ *overhang }, dilate1);
         }
         // it's basically the combination of push_back and intersects, but saves an offset_ex
-        bool push_back_if_intersects(const ExPolygon& region, int layer_nr, coordf_t offset) {
+        // FORK(tree-support-small-overhang-fix): link_offset (>= offset) is used only for the "touches the previous
+        // layer's overhang" test; merged_poly keeps being dilated by offset.
+        bool push_back_if_intersects(const ExPolygon& region, int layer_nr, coordf_t offset, coordf_t link_offset) {
             bool is_intersect = false;
             ExPolygons dilate1;
             BoundingBox bbox;
@@ -847,9 +849,16 @@ void TreeSupport::detect_overhangs(bool check_support_necessity/* = false*/)
                 dilate1 = offset_ex(region, offset);
                 if (dilate1.empty()) break;
                 bbox = get_extents(dilate1);
-                if (!merged_bbox.overlap(bbox))
-                    break;
-                is_intersect = overlaps({ *overhang }, dilate1);
+                ExPolygons dilate_link;
+                if (link_offset > offset) {
+                    dilate_link = offset_ex(region, link_offset);
+                    if (!merged_bbox.overlap(get_extents(dilate_link)))
+                        break;
+                } else {
+                    if (!merged_bbox.overlap(bbox))
+                        break;
+                }
+                is_intersect = overlaps({ *overhang }, link_offset > offset ? dilate_link : dilate1);
             } while (0);
             if (is_intersect) {
                 layer_overhangs.emplace(layer_nr, &region);
@@ -863,11 +872,11 @@ void TreeSupport::detect_overhangs(bool check_support_necessity/* = false*/)
     };
     std::vector<OverhangCluster> overhangClusters;
 
-    auto find_and_insert_cluster = [](auto &regionClusters, const ExPolygon &region, int layer_nr, coordf_t offset) {
+    auto find_and_insert_cluster = [](auto &regionClusters, const ExPolygon &region, int layer_nr, coordf_t offset, coordf_t link_offset) {
         OverhangCluster *cluster = nullptr;
         for (int i = 0; i < regionClusters.size(); i++) {
             auto cluster_i = &regionClusters[i];
-            if (cluster_i->push_back_if_intersects(region, layer_nr, offset)) {
+            if (cluster_i->push_back_if_intersects(region, layer_nr, offset, link_offset)) {
                 cluster = cluster_i;
                 break;
             }
@@ -1139,8 +1148,16 @@ void TreeSupport::detect_overhangs(bool check_support_necessity/* = false*/)
         if (m_object->print()->canceled())
             break;
         Layer* layer = m_object->get_layer(layer_nr);
+        // FORK(tree-support-small-overhang-fix): the overhang strips of consecutive layers on a shallow slope are
+        // lower_layer_offset apart. Dilating by the line width alone failed to link them when that distance
+        // exceeded the line width (e.g. 0.41 mm at 25 deg / 0.2 mm layers vs 0.4 mm lines), so every layer became
+        // its own "small overhang" and was dropped.
+        coordf_t cluster_link_offset = extrusion_width_scaled;
+        if (layer->lower_layer && layer_nr >= enforce_support_layers)
+            cluster_link_offset = std::max(cluster_link_offset,
+                scale_(layer->lower_layer->height / tan(threshold_rad)) + 0.25 * extrusion_width_scaled);
         for (auto& overhang : overhangs_all_layers[layer_nr]) {
-            OverhangCluster* cluster = find_and_insert_cluster(overhangClusters, overhang, layer_nr, extrusion_width_scaled);
+            OverhangCluster* cluster = find_and_insert_cluster(overhangClusters, overhang, layer_nr, extrusion_width_scaled, cluster_link_offset);
             if (overlaps({ overhang }, layer->cantilevers))
                 cluster->is_cantilever = true;
         }
