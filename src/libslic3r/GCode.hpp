@@ -154,6 +154,16 @@ public:
     bool is_first_print() const { return m_is_first_print;}
     void set_is_first_print(bool is) { m_is_first_print = is; }
 
+    // FORK(parallel-gcode-export) BEGIN: the Type2 tower with skipped sparse layers carries the tower's print z
+    // from layer to layer; a --parallel chunk worker has to resume with the value the previous layers left.
+    // Reads as 0 whenever the value cannot influence the output, so that states compare equal.
+    double last_print_z() const { return m_sparse_layers_skipped ? m_last_wipe_tower_print_z : 0.; }
+    void   set_last_print_z(double z) { if (m_sparse_layers_skipped) m_last_wipe_tower_print_z = z; }
+    // The value last_print_z() takes after the layer with index layer_idx (all its tool changes emitted), given
+    // the value before it. Mirrors tool_change() for Type2 towers.
+    double predict_last_print_z(double last_print_z_before, int layer_idx, bool type2) const;
+    // FORK(parallel-gcode-export) END
+
     bool enable_timelapse_print() const { return m_enable_timelapse_print; }
     void set_wipe_tower_depth(float depth) { m_wipe_tower_depth = depth; }
     void set_wipe_tower_bbx(const BoundingBoxf & bbx) { m_wipe_tower_bbx = bbx; }
@@ -558,6 +568,24 @@ protected:
         bool                 overhang_fan;           // overhang_fan_enabled() for the #16050 precompute
         // FORK(parallel-gcode-export) END
     };
+    // FORK(parallel-gcode-export) BEGIN: the state a layer inherits from the layers printed before it and that
+    // changes what is emitted (not just how the travel moves are routed). A chunk is generated before its
+    // predecessor is finished, so it starts from a predicted state; once the predecessor is done the prediction
+    // is compared with the state it really ended in, and the chunk is regenerated on a mismatch.
+    struct ParallelChunkResumeState {
+        int                                 filament_id { -1 };      // the tool selected when the chunk starts, -1: none
+        int                                 layer_index { -1 };      // m_layer_index, counts the layers with something to extrude
+        float                               last_layer_z { 0.f };    // m_last_layer_z, the layer height tag is relative to it
+        bool                                second_layer_things_done { false };
+        std::vector<std::vector<coordf_t>>  skirt_group_done;        // m_skirt_group_done: the skirt / draft shield heights printed so far
+        double                              wipe_tower_last_print_z { 0. };
+
+        // True when a layer generated from either state is emitted the same way. Only the last two skirt heights
+        // of a draft shield, and the number of heights up to skirt_height of a skirt, change the output.
+        bool equivalent_to(const ParallelChunkResumeState &rhs, size_t skirt_height, bool infinite_skirt) const;
+    };
+    ParallelChunkResumeState capture_parallel_resume_state(size_t num_skirt_groups) const;
+    // FORK(parallel-gcode-export) END
     // Builds an independent GCode worker that resumes mid-print at a chunk's first layer, for
     // process_layers_parallel(). Redoes only the cheap, per-worker setup (config, extruders,
     // cooling buffer, wipe tower cursor, ...); the expensive one-time SeamPlacer analysis is
@@ -570,9 +598,7 @@ protected:
         const ParallelChunkSharedState &shared,
         bool                            has_wipe_tower_for_print,
         int                             wipe_tower_layer_idx_seed,
-        unsigned int                    seed_extruder_id,
-        float                           last_layer_z_before_chunk,
-        int                             layer_index_seed) const;
+        const ParallelChunkResumeState &resume) const;
     // Process all layers of a single object instance (sequential mode) with a parallel pipeline:
     // Generate G-code, run the filters (vase mode, cooling buffer), run the G-code analyser
     // and export G-code into file.

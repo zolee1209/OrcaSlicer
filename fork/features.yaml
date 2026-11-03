@@ -189,6 +189,7 @@ features:
   - id: parallel-gcode-export
     name: --parallel – darabolt, többszálú, rétegenkénti G-code szöveg-generálás
     status: fork-only
+    owned_files: [fork/tools/parallel-compare.py]
     hooks: [src/libslic3r/GCode.cpp, src/libslic3r/GCode.hpp, src/libslic3r/GCodeWriter.hpp, src/libslic3r/Print.cpp, src/libslic3r/Print.hpp, src/libslic3r/PrintConfig.cpp, src/OrcaSlicer.cpp]
     cli: [--parallel]
     config: [parallel (CLIMisc)]
@@ -196,7 +197,7 @@ features:
     commits: ["5442021239", 477f05313c, 22d8bb68d0, 5a8a02acdc]
     decision: "2026-10-13: a saját megoldás marad."
     used_by: [routes/api_routes.py run_machine_process (--parallel)]
-    test: null
+    test: "python3 fork/tools/parallel-compare.py <modellek...> (soros vs --parallel)"
     notes: >
       Rebase-szabály: a saját implementáció marad; az upstream export-változásaihoz igazítani kell.
       Legnagyobb rebase-kockázat (GCode::clone_for_parallel_chunk az upstream export-állapotát másolja).
@@ -220,6 +221,13 @@ features:
       support-only rétegek eltűntek, mert a CoolingBuffer őket a következő objektumrétegig tartja vissza, és a chunk
       végén a klón puffere elveszett. A chunk-határok most olyan rétegre esnek, ami után a puffer ürül (objektum- vagy
       raft-réteg), plusz biztonsági flush a chunk végén. Teszt: Benchy + tree(auto)/tree_hybrid, a ;Z: lista azonos a soros úttal.
+      2026-11-03 javítás (fix/parallel-chunk-integrity): a chunk a megelőző rétegek állapotából indul (ParallelChunkResumeState:
+      aktuális szerszám, rétegindex, utolsó réteg-z, 2. réteg átmenet, skirt/draft shield magasságok, Type2 torony z), amit előre
+      becsül; a kiírás előtt a megelőző chunk valódi végállapotával ellenőrzi, eltérésnél (vagy kivételnél) újragenerálja. Javított
+      hibák: (1) a chunk első rétegének szerszáma (toolchange kimaradt / wipe tower "didn't expect" kivétel, pl. cyclic sorrend);
+      (2) draft shield hiányzott a chunk 1+ rétegeiről; (3) raft + egyanyagú nyomtatásnál SIGSEGV (klón WipeTowerIntegration torony nélkül);
+      (4) rétegindex üres rétegek után; (5) skirt_height=0 mellett kimaradt a 2. réteg hőmérséklet-átmenet; (6) a chunk végén lezáratlan
+      EXCLUDE_OBJECT; (7) overhang-estimator seed minden objektumra. Teszt: python3 fork/tools/parallel-compare.py (soros vs --parallel).
 
   - id: slicedata-cache
     name: --export-slicedata / --load-slicedata bináris, párhuzamos (de)szerializáció

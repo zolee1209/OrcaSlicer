@@ -2057,6 +2057,18 @@ static std::vector<Vec2d> get_path_of_change_filament(const Print& print)
         return true;
     }
 
+    // FORK(parallel-gcode-export): see the declaration.
+    double WipeTowerIntegration::predict_last_print_z(double last_print_z_before, int layer_idx, bool type2) const
+    {
+        if (!m_sparse_layers_skipped || !type2 || layer_idx < 0 || layer_idx >= (int) m_tool_changes.size() ||
+            m_tool_changes[layer_idx].empty())
+            return last_print_z_before;
+        // A sparse layer is not printed at all (see tool_change()).
+        if (wipe_tower_layer_is_sparse(m_tool_changes[layer_idx]) && layer_idx != 0)
+            return last_print_z_before;
+        return last_print_z_before + m_tool_changes[layer_idx].front().layer_height;
+    }
+
     // Print is finished. Now it remains to unload the filament safely with ramming over the wipe tower.
     std::string WipeTowerIntegration::finalize(GCode &gcodegen)
     {
@@ -5246,8 +5258,9 @@ void GCode::process_layers(
 //    PlaceholderParser is a plain value type), so {layer_num}/{current_filament_id}/etc. still work.
 //  - cooling buffer / adaptive-PA / wipe tower integration: reconstructed exactly as the real
 //    preamble does, with the wipe tower cursor seeded to the chunk's own starting layer.
-//  - "have we already done this once" one-shot flags (m_second_layer_things_done, m_brim_done):
-//    forced true, since this clone is never actually processing the object's true first layer.
+//  - "have we already done this once" one-shot flags: m_brim_done is forced true (this clone never
+//    processes the object's true first layer); m_second_layer_things_done and the skirt / draft shield
+//    heights printed so far come from the ParallelChunkResumeState (FORK(parallel-gcode-export)).
 // Deliberately left at default/neutral values (documented as acceptable at chunk boundaries):
 // m_last_pos/m_last_pos_defined (forces a safe travel), m_wipe/m_avoid_crossing_perimeters (lose a
 // travel-routing optimization only), m_last_layer_accumulated_mass (a placeholder-var only).
@@ -5257,10 +5270,12 @@ std::unique_ptr<GCode> GCode::clone_for_parallel_chunk(
     const ParallelChunkSharedState &shared,
     bool                            has_wipe_tower_for_print,
     int                             wipe_tower_layer_idx_seed,
-    unsigned int                    seed_extruder_id,
-    float                           last_layer_z_before_chunk,
-    int                             layer_index_seed) const
+    const ParallelChunkResumeState &resume) const
 {
+    // FORK(parallel-gcode-export): the tool the previous layers left selected; without one, the most used tool.
+    const unsigned int seed_extruder_id = resume.filament_id >= 0 ? (unsigned int) resume.filament_id
+        : (unsigned int) std::max(0, tool_ordering.get_most_used_extruder());
+
     auto clone = std::make_unique<GCode>();
     clone->m_print      = this->m_print;
     clone->m_curr_print = this->m_curr_print;
@@ -5303,14 +5318,16 @@ std::unique_ptr<GCode> GCode::clone_for_parallel_chunk(
     clone->m_label_objects_ids              = shared.label_objects_ids;
     clone->m_silent_time_estimator_enabled  = shared.silent_time_estimator_enabled;
     clone->m_layer_count                    = shared.layer_count;
-    clone->m_layer_index                    = layer_index_seed;
-    clone->m_last_layer_z                   = last_layer_z_before_chunk;
-    clone->m_max_layer_z                    = last_layer_z_before_chunk;
+    clone->m_layer_index                    = resume.layer_index;
+    clone->m_last_layer_z                   = resume.last_layer_z;
+    clone->m_max_layer_z                    = resume.last_layer_z;
     clone->m_need_change_layer_lift_z       = true;
 
-    // Mid-print continuation, not the object's real start: skip the one-shot 1st->2nd layer
-    // temperature/acceleration transition and brim generation.
-    clone->m_second_layer_things_done = true;
+    // Mid-print continuation, not the object's real start: skip brim generation. The one-shot
+    // 1st->2nd layer temperature/acceleration transition and the skirt / draft shield heights
+    // already printed come from the state the previous layers left behind.
+    clone->m_second_layer_things_done = resume.second_layer_things_done;
+    clone->m_skirt_group_done         = resume.skirt_group_done; // FORK(parallel-gcode-export)
     clone->m_brim_done                = true;
 
     clone->m_cooling_buffer = make_unique<CoolingBuffer>(*clone);
@@ -5329,10 +5346,51 @@ std::unique_ptr<GCode> GCode::clone_for_parallel_chunk(
         clone->m_wipe_tower->set_wipe_tower_bbx(print.get_wipe_tower_bbx());
         clone->m_wipe_tower->set_rib_offset(print.get_rib_offset());
         clone->m_wipe_tower->set_layer_idx(wipe_tower_layer_idx_seed);
+        clone->m_wipe_tower->set_last_print_z(resume.wipe_tower_last_print_z); // FORK(parallel-gcode-export)
     }
 
     return clone;
 }
+
+// FORK(parallel-gcode-export) BEGIN
+GCode::ParallelChunkResumeState GCode::capture_parallel_resume_state(size_t num_skirt_groups) const
+{
+    ParallelChunkResumeState state;
+    state.filament_id              = m_writer.filament() != nullptr ? int(m_writer.filament()->id()) : -1;
+    state.layer_index              = m_layer_index;
+    state.last_layer_z             = m_last_layer_z;
+    state.second_layer_things_done = m_second_layer_things_done;
+    state.skirt_group_done         = m_skirt_group_done;
+    // A worker that has not processed a layer yet has not sized the per-group lists.
+    state.skirt_group_done.resize(num_skirt_groups);
+    state.wipe_tower_last_print_z  = m_wipe_tower ? m_wipe_tower->last_print_z() : 0.;
+    return state;
+}
+
+bool GCode::ParallelChunkResumeState::equivalent_to(const ParallelChunkResumeState &rhs, size_t skirt_height, bool infinite_skirt) const
+{
+    if (filament_id != rhs.filament_id || layer_index != rhs.layer_index || second_layer_things_done != rhs.second_layer_things_done ||
+        std::abs(last_layer_z - rhs.last_layer_z) > 1e-4f || std::abs(wipe_tower_last_print_z - rhs.wipe_tower_last_print_z) > 1e-6 ||
+        skirt_group_done.size() != rhs.skirt_group_done.size())
+        return false;
+    for (size_t g = 0; g < skirt_group_done.size(); ++g) {
+        const std::vector<coordf_t> &a = skirt_group_done[g];
+        const std::vector<coordf_t> &b = rhs.skirt_group_done[g];
+        // Nothing is printed any more once the skirt has its height; the draft shield keeps going and
+        // takes the height of its next layer from the last two entries.
+        const size_t first_a = infinite_skirt ? (a.size() > 2 ? a.size() - 2 : 0) : 0;
+        const size_t first_b = infinite_skirt ? (b.size() > 2 ? b.size() - 2 : 0) : 0;
+        if (!infinite_skirt && a.size() >= skirt_height && b.size() >= skirt_height)
+            continue;
+        if (a.size() - first_a != b.size() - first_b)
+            return false;
+        for (size_t i = 0; i < a.size() - first_a; ++i)
+            if (std::abs(a[first_a + i] - b[first_b + i]) > 1e-6)
+                return false;
+    }
+    return true;
+}
+// FORK(parallel-gcode-export) END
 
 // ORCA: --parallel. Splits layers_to_print into contiguous chunks, generated concurrently by
 // independent GCode workers (chunk 0 reuses *this; later chunks use clone_for_parallel_chunk()),
@@ -5344,9 +5402,12 @@ std::unique_ptr<GCode> GCode::clone_for_parallel_chunk(
 // (spiral vase / pressure equalizer are excluded by the caller).
 //
 // Trade-off (by design, see docs/PARALLEL_GCODE_FEASIBILITY.md): each internal chunk boundary may
-// contain a non-optimal extra travel move and/or an extra tool change, and per-layer placeholder
-// values that depend on true cumulative print state (e.g. curr_accumulated_mass) reset at chunk
-// starts. This g-code is intended for fast, approximate time/filament estimation, not printing.
+// contain a non-optimal extra travel move, and per-layer placeholder values that depend on true
+// cumulative print state (e.g. curr_accumulated_mass) reset at chunk starts. This g-code is intended
+// for fast, approximate time/filament estimation, not printing.
+// FORK(parallel-gcode-export): what is emitted (tools, layers, skirt, tower) never depends on the split:
+// a chunk resumes from a predicted ParallelChunkResumeState, which is verified against the real end
+// state of the previous chunk before the chunk is written, and the chunk is regenerated if it differs.
 void GCode::process_layers_parallel(
     const Print                                                         &print,
     const ToolOrdering                                                  &tool_ordering,
@@ -5355,9 +5416,11 @@ void GCode::process_layers_parallel(
     GCodeOutputStream                                                   &output_stream)
 {
     const size_t n_layers = layers_to_print.size();
-    // Skirt/brim only ever print on the very first few layers: keep chunk 0 large enough that no
-    // other chunk boundary can ever land inside that zone.
-    const size_t min_first_chunk_layers = std::max<size_t>(1, size_t(print.config().skirt_height.value) + 1);
+    // Skirt/brim only ever print on the very first few layers, and the 1st->2nd layer transition
+    // (temperatures, accelerations) happens on the second one: keep chunk 0 large enough that no
+    // other chunk boundary can land inside that zone.
+    // FORK(parallel-gcode-export): the transition needs two layers even without a skirt.
+    const size_t min_first_chunk_layers = std::max<size_t>(2, size_t(print.config().skirt_height.value) + 1);
 
     const unsigned int hw_threads = std::max(1u, std::thread::hardware_concurrency());
     // Clone construction is now cheap (SeamPlacer is shared, not recomputed per clone -- see
@@ -5408,7 +5471,10 @@ void GCode::process_layers_parallel(
     // support layer height, e.g. tree hybrid) until the next object layer flushes it, so a chunk must
     // end right after a layer that flushes it; otherwise the buffered layers die with the chunk's worker.
     {
-        const auto flushes_cooling_buffer = [&layers_to_print](size_t i) {
+        const auto flushes_cooling_buffer = [&layers_to_print, &tool_ordering](size_t i) {
+            // process_layer() returns early, without asking for a flush, when the layer has no tool to print with.
+            if (tool_ordering.tools_for_layer(layers_to_print[i].first).extruders.empty())
+                return false;
             for (const LayerToPrint &ltp : layers_to_print[i].second) {
                 if (ltp.object_layer != nullptr)
                     return true;
@@ -5440,7 +5506,10 @@ void GCode::process_layers_parallel(
             + (tool_ordering.tools_for_layer(layers_to_print[i].first).has_wipe_tower ? 1 : 0);
 
     std::vector<std::unique_ptr<GCode>> chunk_workers(n_real_chunks);
-    const bool has_wipe_tower_for_print = tool_ordering.has_wipe_tower();
+    // FORK(parallel-gcode-export): the same condition as the main worker's WipeTowerIntegration (see _do_export()): a
+    // print without a tower can still have tool ordering layers marked for one (e.g. raft layers), and the data a
+    // tower integration reads (priming, final purge) does not exist then.
+    const bool has_wipe_tower_for_print = this->m_wipe_tower != nullptr && tool_ordering.has_wipe_tower();
 
     // Snapshot the handful of *this fields clone_for_parallel_chunk() needs, serially, right here
     // -- i.e. before chunk 0 (which reuses *this) starts mutating some of them concurrently.
@@ -5452,6 +5521,77 @@ void GCode::process_layers_parallel(
         m_writer.get_xy_offset(), m_imex_parallel_mode, m_imex_head_filament_map, m_toolchange_count,
         overhang_fan_enabled(print.config(), m_enable_cooling_markers)};
 
+    // FORK(parallel-gcode-export) BEGIN: predict the state each chunk inherits from the layers before it.
+    // The chunks are generated concurrently, so a chunk cannot wait for its predecessor's real end state;
+    // the prediction is verified against the real one when the chunk is written (see the output stage).
+    const size_t num_skirt_groups = print.skirt_brim_groups().size();
+    const size_t skirt_height     = size_t(std::max(0, print.config().skirt_height.value));
+    const bool   infinite_skirt   = print.has_infinite_skirt();
+    std::vector<ParallelChunkResumeState> seed_states(n_real_chunks);
+    {
+        const bool           has_skirt_or_draft = print.has_skirt() || infinite_skirt;
+        const bool           wipe_tower_type2   = this->wipe_tower_type() == WipeTowerType::Type2;
+        ParallelChunkResumeState run = this->capture_parallel_resume_state(num_skirt_groups);
+        int                  wipe_tower_idx = -1;
+        size_t               next_chunk = 1;
+        for (size_t i = 0; i < n_layers && next_chunk < n_real_chunks; ++i) {
+            if (i == ranges[next_chunk].first)
+                seed_states[next_chunk++] = run;
+            // Mirrors what process_layers_parallel() / process_layer() do to the state, layer by layer.
+            const LayerTools &layer_tools = tool_ordering.tools_for_layer(layers_to_print[i].first);
+            if (m_wipe_tower && layer_tools.has_wipe_tower)
+                ++wipe_tower_idx;
+            // process_layer() returns before it changes anything when there is nothing to extrude.
+            if (layer_tools.extruders.empty())
+                continue;
+            const Layer *layer = nullptr;
+            for (const LayerToPrint &ltp : layers_to_print[i].second)
+                if (ltp.object_layer != nullptr) {
+                    layer = ltp.object_layer;
+                    break;
+                }
+            if (layer == nullptr)
+                for (const LayerToPrint &ltp : layers_to_print[i].second)
+                    if (ltp.support_layer != nullptr) {
+                        layer = ltp.support_layer;
+                        break;
+                    }
+            const bool first_layer = layer != nullptr && layer->id() == 0 && std::abs(layer->bottom_z()) < EPSILON;
+            ++run.layer_index;
+            run.last_layer_z = float(layers_to_print[i].first);
+            // The tools of a layer are printed in order, the last one stays selected.
+            run.filament_id = int(layer_tools.extruders.back());
+            if (!first_layer)
+                run.second_layer_things_done = true;
+            if (has_skirt_or_draft && layer_tools.has_skirt)
+                for (size_t g = 0; g < num_skirt_groups; ++g) {
+                    if (print.skirt_brim_groups()[g].skirt.empty())
+                        continue;
+                    std::vector<coordf_t> &done = run.skirt_group_done[g];
+                    if (first_layer) {
+                        if (done.empty())
+                            done.push_back(layer_tools.print_z);
+                    } else if (!done.empty() && (done.size() < skirt_height || infinite_skirt) && done.back() < layer_tools.print_z - EPSILON)
+                        done.push_back(layer_tools.print_z);
+                }
+            if (m_wipe_tower && layer_tools.has_wipe_tower)
+                run.wipe_tower_last_print_z = m_wipe_tower->predict_last_print_z(run.wipe_tower_last_print_z, wipe_tower_idx, wipe_tower_type2);
+        }
+    }
+    // ORCA_PARALLEL_TEST_MISPREDICT=1 starts every other chunk from another tool, to exercise the regeneration below.
+    if (const char *env = std::getenv("ORCA_PARALLEL_TEST_MISPREDICT"); env != nullptr && std::atoi(env) != 0) {
+        const std::vector<unsigned int> &tools = tool_ordering.all_extruders();
+        for (size_t c = 1; c < n_real_chunks && tools.size() > 1; c += 2) {
+            auto it = std::find(tools.begin(), tools.end(), (unsigned int) seed_states[c].filament_id);
+            seed_states[c].filament_id = int(tools[it == tools.end() ? 0 : (size_t(it - tools.begin()) + 1) % tools.size()]);
+        }
+    }
+    const auto make_chunk_worker = [&](size_t c, const ParallelChunkResumeState &resume) {
+        return this->clone_for_parallel_chunk(const_cast<Print &>(print), tool_ordering, shared_state, has_wipe_tower_for_print,
+            wipe_tower_prefix[ranges[c].first] - 1, resume);
+    };
+    // FORK(parallel-gcode-export) END
+
     // Build every non-chunk-0 worker serially, *before* launching the parallel region below.
     // clone_for_parallel_chunk() calls SeamPlacer::init(), which itself runs a tbb::parallel_for
     // over the (shared, read-only-in-principle) Print/PrintObject/mesh data; SeamPlacer's own
@@ -5461,14 +5601,7 @@ void GCode::process_layers_parallel(
     // only the actual per-layer text generation below (the expensive part) runs concurrently.
     ForkPerfScope perf_clones("parallel: build chunk workers"); // FORK(perf-phase-timers)
     for (size_t c = 1; c < n_real_chunks; ++c) {
-        const size_t begin = ranges[c].first;
-        const LayerTools  &first_layer_tools = tool_ordering.tools_for_layer(layers_to_print[begin].first);
-        const unsigned int seed_extruder  = !first_layer_tools.extruders.empty()
-            ? first_layer_tools.extruders.front()
-            : (unsigned int) std::max(0, tool_ordering.get_most_used_extruder());
-        const float        last_z_before  = (begin > 0) ? float(layers_to_print[begin - 1].first) : 0.f;
-        chunk_workers[c] = this->clone_for_parallel_chunk(const_cast<Print &>(print), tool_ordering, shared_state,
-            has_wipe_tower_for_print, wipe_tower_prefix[begin] - 1, seed_extruder, last_z_before, int(begin) - 1);
+        chunk_workers[c] = make_chunk_worker(c, seed_states[c]);
         print.throw_if_canceled();
     }
 
@@ -5485,6 +5618,7 @@ void GCode::process_layers_parallel(
     // written (i.e. run through the G-code processor) strictly in layer order as soon as each one and
     // all its predecessors are done. The token limit bounds how many finished chunk texts may wait
     // for the writer, which also bounds peak memory.
+    std::vector<ParallelChunkResumeState> end_states(n_real_chunks);
     auto generate_chunk = [&](size_t c) -> std::string {
         const size_t begin = ranges[c].first, end = ranges[c].second;
         GCode *worker = (c == 0) ? this : chunk_workers[c].get();
@@ -5510,13 +5644,17 @@ void GCode::process_layers_parallel(
         };
         bool   cooling_pending  = false;
         size_t pending_layer_id = 0;
-        // A fresh estimator has no previous layer, so the chunk's first layer would lose its
-        // overhang/curled-edge data. Seed it with each object's lower layer, which is what the
-        // serial pipeline prepared last in the common case.
-        if (c > 0)
-            for (const LayerToPrint &ltp : layers_to_print[begin].second)
-                if (ltp.object_layer != nullptr && ltp.object_layer->lower_layer != nullptr)
-                    worker->m_extrusion_quality_estimator.prepare_for_new_layer(ltp.original_object, ltp.object_layer->lower_layer);
+        // A fresh estimator has no previous layer, so the first layer of every object in the chunk would
+        // lose its overhang/curled-edge data. Seed it with each object's lower layer, which is what the
+        // serial pipeline prepared last in the common case. FORK(parallel-gcode-export): not only for the
+        // objects of the chunk's first layer -- with different layer heights an object may start later.
+        if (c > 0) {
+            std::unordered_set<const PrintObject*> seeded;
+            for (size_t i = begin; i < end; ++i)
+                for (const LayerToPrint &ltp : layers_to_print[i].second)
+                    if (ltp.object_layer != nullptr && seeded.insert(ltp.original_object).second && ltp.object_layer->lower_layer != nullptr)
+                        worker->m_extrusion_quality_estimator.prepare_for_new_layer(ltp.original_object, ltp.object_layer->lower_layer);
+        }
         for (size_t i = begin; i < end; ++i) {
             const auto       &layer_pair  = layers_to_print[i];
             const LayerTools  &layer_tools = tool_ordering.tools_for_layer(layer_pair.first);
@@ -5540,6 +5678,11 @@ void GCode::process_layers_parallel(
             append_processed(worker->m_cooling_buffer->process_layer({}, pending_layer_id, true));
         // The precomputed data points into this print's layers.
         worker->m_extrusion_quality_estimator.set_precomputed_layers({});
+        // FORK(parallel-gcode-export): the serial export closes the object the last layer left open when the next
+        // layer changes; a chunk has no next layer, and the next chunk starts a new label of its own.
+        worker->m_writer.add_object_end_labels(out);
+        // FORK(parallel-gcode-export): what the next chunk should have started from.
+        end_states[c] = worker->capture_parallel_resume_state(num_skirt_groups);
         return out;
     };
 
@@ -5547,9 +5690,11 @@ void GCode::process_layers_parallel(
     {
         size_t      index { 0 };
         std::string text;
+        bool        failed { false }; // FORK(parallel-gcode-export): see the output stage
     };
     size_t next_chunk     = 0;
     size_t layers_written = 0;
+    size_t chunks_regenerated = 0; // FORK(parallel-gcode-export)
     const size_t max_tokens = std::max<size_t>(2, 2 * size_t(hw_threads));
     tbb::parallel_pipeline(max_tokens,
         tbb::make_filter<void, size_t>(slic3r_tbb_filtermode::serial_in_order,
@@ -5562,7 +5707,21 @@ void GCode::process_layers_parallel(
             }) &
         tbb::make_filter<size_t, ChunkText>(slic3r_tbb_filtermode::parallel,
             [&generate_chunk, &chunk_workers, &perf_last_chunk_generated, n_real_chunks](size_t c) -> ChunkText {
-                ChunkText chunk { c, generate_chunk(c) };
+                ChunkText chunk { c, {} };
+                // FORK(parallel-gcode-export): a chunk generated from a wrong predicted state may fail on it (e.g. the
+                // wipe tower is asked for a tool change it does not have). It is generated again in the output stage,
+                // from the state its predecessor really ended in, and only a failure there is an error.
+                if (c == 0)
+                    chunk.text = generate_chunk(c);
+                else
+                    try {
+                        chunk.text = generate_chunk(c);
+                    } catch (const CanceledException &) {
+                        throw;
+                    } catch (const std::exception &ex) {
+                        BOOST_LOG_TRIVIAL(info) << "[fork-perf] parallel: chunk " << c << " failed (" << ex.what() << "), will be regenerated";
+                        chunk.failed = true;
+                    }
                 // The worker is done; only the last one is needed afterwards (tail resync below).
                 if (c != 0 && c + 1 != n_real_chunks)
                     chunk_workers[c].reset();
@@ -5572,6 +5731,22 @@ void GCode::process_layers_parallel(
             }) &
         tbb::make_filter<ChunkText, void>(slic3r_tbb_filtermode::serial_in_order,
             [&](ChunkText chunk) {
+                // FORK(parallel-gcode-export) BEGIN: the chunk was generated from a predicted state. Now that its
+                // predecessor is written, the real state is known: if the chunk started from something else (a
+                // tool change, a skirt layer or a wipe tower layer height it could not know about), generate it
+                // again, so that the output never depends on how the layers were split.
+                if (chunk.index > 0 && (chunk.failed || !end_states[chunk.index - 1].equivalent_to(seed_states[chunk.index], skirt_height, infinite_skirt))) {
+                    BOOST_LOG_TRIVIAL(info) << "[fork-perf] parallel: chunk " << chunk.index << " started from a different state than its "
+                                            << "predecessor ended in (tool " << seed_states[chunk.index].filament_id << " vs "
+                                            << end_states[chunk.index - 1].filament_id << "), regenerating";
+                    seed_states[chunk.index]  = end_states[chunk.index - 1];
+                    chunk_workers[chunk.index] = make_chunk_worker(chunk.index, seed_states[chunk.index]);
+                    chunk.text = generate_chunk(chunk.index);
+                    if (chunk.index + 1 != n_real_chunks)
+                        chunk_workers[chunk.index].reset();
+                    ++chunks_regenerated;
+                }
+                // FORK(parallel-gcode-export) END
                 const ForkPerfClock::time_point perf_t0 = ForkPerfClock::now(); // FORK(perf-phase-timers)
                 output_stream.write(chunk.text);
                 perf_output_ms += fork_perf_ms_since(perf_t0); // FORK(perf-phase-timers)
@@ -5584,6 +5759,7 @@ void GCode::process_layers_parallel(
 
     // FORK(perf-phase-timers) BEGIN
     perf_pipeline.stop();
+    BOOST_LOG_TRIVIAL(info) << "[fork-perf] parallel: " << chunks_regenerated << " of " << n_real_chunks << " chunks regenerated";
     fork_perf_log("parallel: output stage (write + GCodeProcessor) sum", perf_output_ms);
     fork_perf_log("parallel: tail after last chunk generated", fork_perf_ms_since(perf_last_chunk_generated));
     // FORK(perf-phase-timers) END
@@ -5597,6 +5773,7 @@ void GCode::process_layers_parallel(
             this->m_writer.reseat_current_extruder(last_worker.m_writer.filament()->id());
         this->m_last_pos             = last_worker.m_last_pos;
         this->m_last_pos_defined     = last_worker.m_last_pos_defined;
+        this->m_layer_index          = last_worker.m_layer_index; // FORK(parallel-gcode-export)
         this->m_last_layer_z         = last_worker.m_last_layer_z;
         this->m_max_layer_z          = std::max(this->m_max_layer_z, last_worker.m_max_layer_z);
         this->m_last_extrusion_role  = last_worker.m_last_extrusion_role;
